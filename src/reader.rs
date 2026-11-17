@@ -88,7 +88,7 @@ impl Reader {
                 .flatten()
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            stored || std::env::var("GLOSSA_FACING").ok().as_deref() == Some("1")
+            stored || std::env::var("MARGINAL_FACING").ok().as_deref() == Some("1")
         };
         let reader = Reader {
             facing: facing_pref,
@@ -949,7 +949,7 @@ impl Reader {
             &img.rgba,
         );
         let tex = ctx.load_texture(
-            format!("glossa-page-{}-{}", self.book.id, page_no),
+            format!("marginal-page-{}-{}", self.book.id, page_no),
             color,
             egui::TextureOptions::LINEAR,
         );
@@ -991,7 +991,7 @@ impl Reader {
             }
         }
         let ci = egui::ColorImage::from_rgba_unmultiplied([s, s], &px);
-        let tex = ctx.load_texture("glossa-shadow", ci, egui::TextureOptions::LINEAR);
+        let tex = ctx.load_texture("marginal-shadow", ci, egui::TextureOptions::LINEAR);
         self.shadow = Some(tex.clone());
         tex
     }
@@ -1022,7 +1022,7 @@ impl Reader {
             px.extend([c.r(), c.g(), c.b(), 255]);
         }
         let ci = egui::ColorImage::from_rgba_unmultiplied([size, size], &px);
-        let tex = ctx.load_texture(format!("glossa-grain-{key}"), ci, egui::TextureOptions::NEAREST_REPEAT);
+        let tex = ctx.load_texture(format!("marginal-grain-{key}"), ci, egui::TextureOptions::NEAREST_REPEAT);
         self.grain.insert(key, tex.clone());
         tex
     }
@@ -1658,7 +1658,7 @@ impl Reader {
                 }
                 if ui.button("⬇ Import sidecar").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Glossa sidecar", &["json"])
+                        .add_filter("Marginal sidecar", &["json"])
                         .pick_file()
                     {
                         let res =

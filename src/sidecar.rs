@@ -1,4 +1,4 @@
-//! Sidecar import/export: `.glossa.json` files that live next to the books.
+//! Sidecar import/export: `.marginal.json` files that live next to the books.
 //! They carry the full annotation layer for one book (including links),
 //! so annotations travel with the book when you move or share the file.
 
@@ -11,7 +11,7 @@ use crate::store::Store;
 
 #[derive(Serialize, Deserialize)]
 pub struct Sidecar {
-    pub format: String,       // "glossa-sidecar"
+    pub format: String,       // "marginal-sidecar"
     pub version: u32,         // 1
     pub source_fingerprint: String,
     pub exported_at: i64,
@@ -37,7 +37,7 @@ pub fn sidecar_path_for(book_path: &str) -> std::path::PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("book");
-    let sidecar_path = PathBuf::from(format!("{stem}.glossa.json"));
+    let sidecar_path = PathBuf::from(format!("{stem}.marginal.json"));
     let out: std::path::PathBuf = book
         .parent()
         .map(|p| p.join(&sidecar_path))
@@ -69,7 +69,7 @@ pub fn export(store: &Store, book: &BookMeta) -> Result<std::path::PathBuf> {
     }
 
     let sidecar = Sidecar {
-        format: "glossa-sidecar".into(),
+        format: "marginal-sidecar".into(),
         version: 1,
         source_fingerprint: book.fingerprint.clone(),
         exported_at: now_secs(),

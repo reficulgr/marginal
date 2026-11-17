@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Fetches the pdfium shared library into ~/.local/share/glossa/pdfium
-# (the location Glossa looks at by default).
+# Fetches the pdfium shared library into ~/.local/share/marginal/pdfium
+# (the location Marginal looks at by default).
 set -euo pipefail
 
-dest="${GLOSSA_PDFIUM_DIR:-$HOME/.local/share/glossa/pdfium}"
+dest="${MARGINAL_PDFIUM_DIR:-$HOME/.local/share/marginal/pdfium}"
 tag="chromium/8125"
 
 case "$(uname -m)" in
@@ -27,4 +27,4 @@ chmod +x "${dest}/libpdfium.so"
 
 echo
 echo "Installed: ${dest}/libpdfium.so"
-echo "Glossa will find it automatically (or set GLOSSA_PDFIUM_LIB)."
+echo "Marginal will find it automatically (or set GLOSSA_PDFIUM_LIB)."

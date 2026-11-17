@@ -53,7 +53,7 @@ impl Library {
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                     let tex =
-                        ctx.load_texture(format!("glossa-thumb-{}", b.id), ci, egui::TextureOptions::LINEAR);
+                        ctx.load_texture(format!("marginal-thumb-{}", b.id), ci, egui::TextureOptions::LINEAR);
                     self.tex_cache.insert(b.id, tex);
                 }
             }
@@ -68,7 +68,7 @@ impl Library {
             .show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("📚 Glossa");
+                ui.heading("📚 Marginal");
                 ui.separator();
                 if ui.button("📁 Choose folder…").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {

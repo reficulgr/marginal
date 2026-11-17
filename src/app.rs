@@ -25,7 +25,7 @@ enum Mode {
     Reader,
 }
 
-pub struct GlossaApp {
+pub struct MarginalApp {
     store: SharedStore,
     mode: Mode,
     library: Library,
@@ -35,7 +35,7 @@ pub struct GlossaApp {
     errors_pending: Vec<String>,
 }
 
-impl GlossaApp {
+impl MarginalApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -55,10 +55,10 @@ impl GlossaApp {
         });
         crate::theme::register_fonts(&cc.egui_ctx);
 
-        // test/automation hook: GLOSSA_OPEN=<book_id>:<page> (screenshot workflow)
+        // test/automation hook: MARGINAL_OPEN=<book_id>:<page> (screenshot workflow)
         let mut mode = Mode::Library;
         let mut reader = None;
-        if let Ok(spec) = std::env::var("GLOSSA_OPEN") {
+        if let Ok(spec) = std::env::var("MARGINAL_OPEN") {
             let spec = spec.trim().to_string();
             if let Some((id_s, page_s)) = spec.split_once(':') {
                 if let (Ok(id), Ok(page)) = (id_s.parse::<i64>(), page_s.parse::<u32>()) {
@@ -72,7 +72,7 @@ impl GlossaApp {
             }
         }
 
-        Ok(GlossaApp {
+        Ok(MarginalApp {
             store,
             mode,
             library,
@@ -121,7 +121,7 @@ impl GlossaApp {
     }
 }
 
-impl eframe::App for GlossaApp {
+impl eframe::App for MarginalApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan(ctx);
     }

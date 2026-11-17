@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates a tiny multi-page test PDF (no external deps) for testing Glossa."""
+"""Generates a tiny multi-page test PDF (no external deps) for testing Marginal."""
 import sys, zlib
 
 def make_pdf(path, title=None, pages=6, w=595, h=842):

@@ -32,7 +32,20 @@ impl Store {
     }
 
     pub fn open_default() -> Result<Store> {
-        Store::open(&data_dir().join("glossa.db"))
+        let new_db = data_dir().join("marginal.db");
+        if !new_db.exists() {
+            let legacy = legacy_data_dir();
+            for name in ["glossa.db", "glossa.db-wal", "glossa.db-shm"] {
+                let src = legacy.join(name);
+                if src.exists() {
+                    if let Some(parent) = new_db.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::copy(&src, parent.join(name.replace("glossa", "marginal")));
+                    }
+                }
+            }
+        }
+        Store::open(&new_db)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -397,8 +410,8 @@ pub struct BookWithStat {
     pub book: BookMeta,
 }
 
-/// Well-known data directory (XDG) for glossa's database and pdfium binary.
-pub fn data_dir() -> PathBuf {
+/// Well-known data directory (XDG) for marginal's database and pdfium binary.
+pub fn legacy_data_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
@@ -414,4 +427,13 @@ pub fn with_store<T>(store: &SharedStore, f: impl FnOnce(&Store) -> Result<T>) -
         .lock()
         .map_err(|_| anyhow!("store mutex poisoned"))?;
     f(&g)
+}
+
+/// Well-known data directory (XDG) for marginal's database and pdfium binary.
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("marginal")
 }

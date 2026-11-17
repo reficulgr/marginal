@@ -1,5 +1,5 @@
 //! PDF rendering via pdfium-render. The pdfium shared library is resolved
-//! from (1) $GLOSSA_PDFIUM_LIB, (2) <data_dir>/pdfium/libpdfium.so,
+//! from (1) $MARGINAL_PDFIUM_LIB, (2) <data_dir>/pdfium/libpdfium.so,
 //! (3) ./vendor/pdfium/libpdfium.so, (4) system library search path.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,10 +15,12 @@ static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
 
 fn candidate_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(p) = std::env::var("GLOSSA_PDFIUM_LIB") {
+    if let Ok(p) = std::env::var("MARGINAL_PDFIUM_LIB")
+            .or_else(|_| std::env::var("GLOSSA_PDFIUM_LIB")) {
         out.push(PathBuf::from(p));
     }
     out.push(data_dir().join("pdfium").join("libpdfium.so"));
+    out.push(crate::store::legacy_data_dir().join("pdfium").join("libpdfium.so"));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             out.push(dir.join("libpdfium.so"));
@@ -50,7 +52,7 @@ pub fn engine() -> Result<&'static Pdfium> {
         anyhow!(
             "pdfium library not found.\n\
              Run `scripts/fetch-pdfium.sh` to install it into {},\n\
-             or set GLOSSA_PDFIUM_LIB to the path of libpdfium.so.",
+             or set MARGINAL_PDFIUM_LIB (legacy GLOSSA_PDFIUM_LIB also accepted) to the path of libpdfium.so.",
             data_dir().join("pdfium").display()
         )
     })

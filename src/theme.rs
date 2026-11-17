@@ -98,7 +98,7 @@ pub fn note_font() -> egui::FontId {
 pub fn register_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "glossa-rocksalt".into(),
+        "marginal-rocksalt".into(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/RockSalt-Regular.ttf"
         ))),
@@ -108,7 +108,7 @@ pub fn register_fonts(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Name(NOTE_FONT_FAMILY.into()))
         .or_default()
-        .push("glossa-rocksalt".into());
+        .push("marginal-rocksalt".into());
     ctx.set_fonts(fonts);
 }
 

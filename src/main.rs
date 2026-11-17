@@ -17,8 +17,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Headless conveniences for testing without a display:
-    //   glossa --scan <dir>          index a folder and print the library
-    //   glossa --render <pdf> <page> <out.png>
+    //   marginal --scan <dir>         index a folder and print the library
+    //   marginal --render <pdf> <page> <out.png>
     if args.len() == 2 && args[0] == "--scan" {
         match headless_scan(&args[1]) {
             Ok(()) => {}
@@ -40,12 +40,12 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("glossa — marginalia & post-it annotations for your book folder");
+        println!("marginal — marginalia & post-it annotations for your book folder");
         println!();
         println!("Usage:");
-        println!("  glossa                       run the graphical app");
-        println!("  glossa --scan <dir>          headless: index a folder, print results");
-        println!("  glossa --render <pdf> <page> <out.png>   headless render one page");
+        println!("  marginal                     run the graphical app");
+        println!("  marginal --scan <dir>        headless: index a folder, print results");
+        println!("  marginal --render <pdf> <page> <out.png>  headless render one page");
         return;
     }
 
@@ -58,9 +58,9 @@ fn main() {
     };
 
     let result = eframe::run_native(
-        "Glossa — marginalia for your library",
+        "Marginal — marginalia for your library",
         native,
-        Box::new(|cc| Ok(Box::new(app::GlossaApp::new(cc)?))),
+        Box::new(|cc| Ok(Box::new(app::MarginalApp::new(cc)?))),
     );
     if let Err(e) = result {
         eprintln!("eframe error: {e}");
