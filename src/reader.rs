@@ -163,14 +163,16 @@ impl Reader {
     /// Give legacy post-its (anchor-only) a hung card position, and stack
     /// cards on the same side so they don't overlap.
     /// Auto-hug: positions for every post-it card that has no user-set
-    /// position in the CURRENT view mode — hung just outside the page's
-    /// fitting edge, stacked per side. User-placed cards register too, so
-    /// autos flow around them.
+    /// position in the CURRENT view mode — hung just outside a page edge,
+    /// stacked per side. In spread (book) view cards always hang toward the
+    /// OUTER edge of the spread (the spine stays clean); `outer_left`
+    /// selects it for the sheet. Single view hangs by pin position.
     fn compute_auto_hangs(
         &self,
         page_anns: &[Annotation],
         page_rect: Rect,
         default_size: [f32; 2],
+        outer_left: Option<bool>,
     ) -> std::collections::HashMap<String, [f32; 2]> {
         let mut out = std::collections::HashMap::new();
         let pw = page_rect.width().max(1.0);
@@ -212,7 +214,11 @@ impl Reader {
                     let [w, h] = size.unwrap_or(default_size);
                     let w = w.max(default_size[0]);
                     let h = h.max(default_size[1]);
-                    let left = x <= 0.5;
+                    // side: book mode → outer edge of the spread; single → pin position
+                    let left = match outer_left {
+                        Some(outer) => outer,
+                        None => x <= 0.5,
+                    };
                     let cx = if left { -(w + 18.0) / pw } else { 1.0 + 18.0 / pw };
                     let stack = if left { &left_stack } else { &right_stack };
                     let h_frac = (h + 10.0) / ph;
@@ -463,18 +469,24 @@ impl Reader {
 
         let postit_min = self.card_min_size(ui);
 
-        // page geometry from the anchor page (pages share the fit)
+        // page geometry from the anchor page (pages share the fit); in book
+        // view we also budget the two outer margins so they stay on screen
         let page_pts = self
             .doc
             .as_ref()
-            .map(|d| d.page_size(self.page.saturating_sub(1) as u32))
+            .map(|d| d.page_size(self.page.saturating_sub(1)))
             .unwrap_or(Ok((595.0, 842.0)))
             .unwrap_or((595.0, 842.0));
-        let page_size = {
-            let avail_h = ui.available_height() - 24.0;
-            let scale = (avail_h / page_pts.1).max(0.05) * self.zoom;
-            vec2(page_pts.0 * scale, page_pts.1 * scale)
+        let avail_h = ui.available_height() - 24.0;
+        let scale_h = (avail_h / page_pts.1).max(0.05) * self.zoom;
+        let base_scale = if self.facing {
+            let outer_budget = (MARGIN_STRIP_W + 18.0) * 2.0 + 60.0;
+            let scale_w = ((ui.available_width() - outer_budget) / (2.0 * page_pts.0)).max(0.02) * self.zoom;
+            scale_h.min(scale_w)
+        } else {
+            scale_h
         };
+        let page_size = vec2(page_pts.0 * base_scale, page_pts.1 * base_scale);
 
         // visible sheets: single = one sheet; book = left+right with a gutter
         let avail = ui.max_rect();
@@ -638,8 +650,9 @@ impl Reader {
             }
         }
 
-        // post-its: pins + auto-hanging cards
-        let auto_hang = self.compute_auto_hangs(page_anns, page_rect, postit_min);
+        // post-its: pins + auto-hugging cards (outer side in book view)
+        let auto_hang =
+            self.compute_auto_hangs(page_anns, page_rect, postit_min, if strip_left { Some(true) } else { Some(false) });
         for ann in page_anns {
             if let Anchor::PostIt { .. } = ann.anchor {
                 let auto = auto_hang.get(&ann.id).copied();
