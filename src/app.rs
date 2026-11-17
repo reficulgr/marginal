@@ -55,8 +55,7 @@ impl GlossaApp {
         });
         crate::theme::register_fonts(&cc.egui_ctx);
 
-        // test/automation hook: GLOSSA_OPEN=<book_id>:<page> opens straight into
-        // the reader (used by the screenshot-based style workflow)
+        // test/automation hook: GLOSSA_OPEN=<book_id>:<page> (screenshot workflow)
         let mut mode = Mode::Library;
         let mut reader = None;
         if let Ok(spec) = std::env::var("GLOSSA_OPEN") {

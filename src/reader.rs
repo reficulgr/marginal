@@ -45,7 +45,7 @@ pub struct Reader {
     annotations: Vec<Annotation>,
     /// pan offset of the whole desk (space+drag, wheel) in screen px
     pan: Vec2,
-    /// paper-grain texture per note color (opaque, flecks baked in)
+    /// paper grain texture, generated once
     grain: std::collections::HashMap<String, egui::TextureHandle>,
 
     /// armed "click on page to add" mode
@@ -98,107 +98,57 @@ impl Reader {
     /// Give legacy post-its (anchor-only) a hung card position, and stack
     /// cards on the same side so they don't overlap.
     fn migrate_postit_cards(&mut self) {
-        // one-time reset to auto-hang positions (computed at draw time)
-        let already = crate::store::with_store(&self.store, |s| s.get_meta("hang_v3"))
-            .ok()
-            .flatten();
-        if already.as_deref() != Some("1") {
-            for i in 0..self.annotations.len() {
-                if let Anchor::PostIt {
-                    x,
-                    y,
-                    card: Some(_),
-                    size,
-                } = self.annotations[i].anchor
-                {
-                    self.annotations[i].anchor = Anchor::PostIt {
-                        x,
-                        y,
-                        card: None,
-                        size,
-                    };
-                    self.save_annotation(self.annotations[i].clone());
-                }
-            }
-            crate::store::with_store(&self.store, |s| s.set_meta("hang_v3", "1")).ok();
+        let indexes: Vec<usize> = self
+            .annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                matches!(&a.anchor, Anchor::PostIt { card: None, .. })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in indexes {
+            self.annotations[i].anchor = self.hang_off_card_pos(i, 0.24, 0.15);
+            self.save_annotation(self.annotations[i].clone());
         }
     }
 
-    /// Auto-hang positions for every page post-it whose card the user
-    /// hasn't personally placed: snug beside the page edge (computed from
-    /// the real px geometry), stacked per side, clamped into view.
-    fn compute_auto_hangs(
-        &self,
-        page_annotations: &[Annotation],
-        page_rect: Rect,
-        default_size: [f32; 2],
-    ) -> std::collections::HashMap<String, [f32; 2]> {
-        let mut out = std::collections::HashMap::new();
-        let pw = page_rect.width().max(1.0);
-        let ph = page_rect.height().max(1.0);
-        let mut left_stack: Vec<f32> = Vec::new();
-        let mut right_stack: Vec<f32> = Vec::new();
-        // creation order for stable stacking across frames
-        for ann in &self.annotations {
-            if !page_annotations.iter().any(|p| p.id == ann.id) {
-                continue;
-            }
-            let Anchor::PostIt {
-                x,
-                y,
-                card,
-                size,
-            } = ann.anchor
-            else {
-                continue;
-            };
-            let [w, h] = size.unwrap_or(default_size);
-            let w = w.max(default_size[0]);
-            let h = h.max(default_size[1]);
-            let left = x <= 0.5;
-            let w_frac = (w + 18.0) / pw;
-            let h_frac = (h + 10.0) / ph;
-            let cy;
-            let cx;
-            match card {
-                Some([cx_, cy_]) => {
-                    // user-placed: keep, but still register for stacking
-                    cx = cx_;
-                    cy = cy_.clamp(-0.2, 1.15);
-                    if left {
-                        left_stack.push(cy);
-                    } else {
-                        right_stack.push(cy);
-                    }
+    /// Card position hanging outside the page for post-it [i] (by index):
+    /// side picked by pin x, vertically centered near the pin row, nudged
+    /// downward past other cards on the same side.
+    /// `w_norm`/`h_norm` = card width/height as fractions of the page size.
+    fn hang_off_card_pos(&self, index: usize, w_norm: f32, h_norm: f32) -> Anchor {
+        let ann = &self.annotations[index];
+        let Anchor::PostIt { x, y, size, .. } = ann.anchor else {
+            return ann.anchor.clone();
+        };
+        let left = x <= 0.5;
+        let cx = if left { -w_norm - 0.01 } else { 1.01 };
+        let mut cy = (y - h_norm * 0.45).max(-0.4);
+        for _ in 0..12 {
+            let overlapping = self.annotations.iter().any(|other| {
+                if let Anchor::PostIt {
+                    card: Some([_, oy]),
+                    x: ox,
+                    ..
+                } = other.anchor
+                {
+                    (ox <= 0.5) == left && (oy - cy).abs() < h_norm + 0.02
+                } else {
+                    false
                 }
-                None => {
-                    cx = if left {
-                        -w_frac
-                    } else {
-                        1.0 + 18.0 / pw
-                    };
-                    let stack = if left { &left_stack } else { &right_stack };
-                    let mut y_c = (y - h_frac * 0.5).clamp(-0.1, 1.06 - h_frac);
-                    for _ in 0..24 {
-                        if !stack
-                            .iter()
-                            .any(|&oy| (oy - y_c).abs() < h_frac + 0.012)
-                        {
-                            break;
-                        }
-                        y_c += h_frac + 0.012;
-                    }
-                    cy = y_c.min(1.1 - h_frac).max(-0.12);
-                    if left {
-                        left_stack.push(cy);
-                    } else {
-                        right_stack.push(cy);
-                    }
-                }
+            });
+            if !overlapping {
+                break;
             }
-            out.insert(ann.id.clone(), [cx, cy]);
+            cy += h_norm + 0.02;
         }
-        out
+        Anchor::PostIt {
+            x,
+            y,
+            card: Some([cx, cy]),
+            size,
+        }
     }
 
     /// Minimum card size: ~15 characters wide by 7 lines tall (font-truthful),
@@ -448,15 +398,11 @@ impl Reader {
             .iter()
             .any(|a| matches!(a.anchor, Anchor::Margin { .. }));
 
-        let postit_min = self.card_min_size(ui);
-
-        // the page floats near the center of the desk, shifted by pan —
-        // and nudged left by the marginalia strip when one is present
+        // the page floats at the top-center of the desk, shifted by pan
         let avail = ui.max_rect();
-        let strip_w = if has_margin_notes { MARGIN_STRIP_W } else { 0.0 };
         let page_rect = Rect::from_min_size(
             pos2(
-                avail.center().x - page_size.x * 0.5 - strip_w * 0.5 + self.pan.x,
+                avail.center().x - page_size.x * 0.5 + self.pan.x,
                 avail.top() + 28.0 + self.pan.y,
             ),
             page_size,
@@ -500,16 +446,15 @@ impl Reader {
         let space_down_now = space_down;
         if resp.clicked() && !space_down_now {
             if let Some(p) = resp.hover_pos() {
+                let postit_min = self.card_min_size(ui);
                 self.on_page_clicked(p, page_rect, postit_min);
             }
         }
 
-        // ----- post-its: pins + auto-hanging cards -----
-        let auto_hang = self.compute_auto_hangs(&page_annotations, page_rect, postit_min);
+        // ----- post-its: pins + hanging cards -----
         for ann in &page_annotations {
             if let Anchor::PostIt { .. } = ann.anchor {
-                let auto = auto_hang.get(&ann.id).copied();
-                self.draw_postit(ui, ann, page_rect, auto);
+                self.draw_postit(ui, ann, page_rect);
             }
         }
 
@@ -584,9 +529,8 @@ impl Reader {
         Some(tex)
     }
 
-    /// Procedural paper-grain tile, per note color: the card color with baked
-    /// luminance wobble and sparse darker flecks — fully OPAQUE, so the mesh
-    /// is solid paper and the vertex shading multiplies over it.
+    /// Procedural paper-grain tile, per note color: card color with baked
+    /// luminance wobble and sparse flecks — OPAQUE, so the paper is solid.
     fn ensure_grain(&mut self, ctx: &egui::Context, color: [u8; 3]) -> egui::TextureHandle {
         let key = format!("{},{},{}", color[0], color[1], color[2]);
         if let Some(t) = self.grain.get(&key) {
@@ -649,6 +593,14 @@ impl Reader {
         };
         crate::store::with_store(&self.store, |s| s.insert_annotation(self.book.id, &ann)).ok();
         self.annotations.push(ann.clone());
+        // post-its: hang the card off the pin, stacked to avoid clutter
+        if let Anchor::PostIt { .. } = ann.anchor {
+            let i = self.annotations.len() - 1;
+            let w_norm = (default_size[0] + 16.0) / page_rect.width();
+            let h_norm = (default_size[1] + 12.0) / page_rect.height();
+            self.annotations[i].anchor = self.hang_off_card_pos(i, w_norm, h_norm);
+            self.save_annotation(self.annotations[i].clone());
+        }
         self.armed = None;
         self.editing = Some(EditingNote {
             id: ann.id,
@@ -663,24 +615,16 @@ impl Reader {
     /// A post-it = a red pin on the page + a paper card hanging on the desk,
     /// joined by a faint dashed thread. Analog paper: hand-tilted silhouette,
     /// dog-ear curl, layered shadow, grain, elastic ink-height, resize grip.
-    fn draw_postit(
-        &mut self,
-        ui: &mut Ui,
-        ann: &Annotation,
-        page_rect: Rect,
-        auto: Option<[f32; 2]>,
-    ) {
+    fn draw_postit(&mut self, ui: &mut Ui, ann: &Annotation, page_rect: Rect) {
         let Anchor::PostIt {
             x,
             y,
-            card,
+            card: Some([cx, cy]),
             size: size_stored,
         } = ann.anchor
         else {
             return;
         };
-        // user-placed position wins; otherwise the auto-hung spot for this frame
-        let [cx, cy] = card.or(auto).unwrap_or([0.4, 0.0]);
 
         // ---- size: user choice, floor = pad minimum, ceiling = the ink ----
         let [min_w, min_h] = self.card_min_size(ui);
@@ -844,16 +788,17 @@ impl Reader {
             ui.painter().galley(card.min + vec2(pad, pad) + wob, g, Color32::from_rgb(40, 40, 40));
         }
 
-        // drag the card anywhere on the desk (this freezes its auto-hang spot)
+        // drag the card anywhere on the desk
         if resp.dragged() {
             let delta = resp.drag_delta();
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
-            if let Anchor::PostIt { card, .. } = &mut moved.anchor {
-                let cur = card.map(|c| (c[0], c[1])).unwrap_or((cx, cy));
-                *card = Some([
-                    cur.0 + delta.x / page_rect.width(),
-                    cur.1 + delta.y / page_rect.height(),
-                ]);
+            if let Anchor::PostIt {
+                card: Some([cx, cy]),
+                ..
+            } = &mut moved.anchor
+            {
+                *cx += delta.x / page_rect.width();
+                *cy += delta.y / page_rect.height();
             }
             self.save_annotation(moved);
         }
@@ -916,9 +861,7 @@ impl Reader {
 
         // the anchor dot on the page edge is itself draggable: grabbing it
         // re-targets which passage this marginalia points at
-        // anchor dot rides on the page edge on the SAME side as the chalk,
-        // so the thread never crosses the reading surface
-        let anchor_pt = pos2(page_rect.right(), y_screen);
+        let anchor_pt = pos2(page_rect.left(), y_screen);
         let dot_id = egui::Id::unique(("margin-anchor", ann.id.clone()));
         let dot_rect = Rect::from_center_size(anchor_pt, vec2(14.0, 14.0));
         ui.advance_cursor_after_rect(dot_rect);
@@ -1320,8 +1263,8 @@ fn paper_corners(card: Rect, seed: u64, scale: f32) -> [Pos2; 4] {
     out
 }
 
-/// Paint one analog post-it: feathered shadows, grain mesh with edge shading,
-/// and a whisper of a dog-ear curl on a seeded corner.
+/// Paint one analog post-it: layered shadow, grain mesh with edge shading,
+/// and a dog-ear curl on a seeded corner.
 fn paint_paper(
     painter: &egui::Painter,
     card: Rect,
@@ -1335,7 +1278,7 @@ fn paint_paper(
     let ear_idx = ((hash01(seed ^ 0xA5A5_A5A5) * 4.0) as usize) % 4;
     let d = 7.0;
 
-    // fold crease endpoints along the curl's two edges
+    // fold crease along the curl's two edges
     let n1 = (ear_idx + 3) % 4;
     let n2 = (ear_idx + 1) % 4;
     let v1 = corners[n1] - corners[ear_idx];
@@ -1348,21 +1291,20 @@ fn paint_paper(
     // ambient shadow: layered translucent quads → feathered edge
     let l = if lifted { 1.0 } else { 0.0 };
     let off = vec2(2.0 + 4.0 * l, 3.0 + 5.0 * l);
-    let layers = [2.0f32, 4.0, 7.0, 11.0, 16.0];
-    let alphas = [13u8, 11, 9, 7, 5];
-    for (inflation, alpha) in layers.iter().zip(alphas.iter()) {
+    for (infl, alpha) in [(2.0f32, 13u8), (4.5, 11), (7.5, 9), (11.5, 7), (16.0, 5)] {
+        let c = card.center();
         let pts: Vec<Pos2> = corners
             .iter()
             .map(|p| {
-                let v = *p - card_center_of(&corners);
-                let ln = v.length().max(1.0) + inflation;
-                card_center_of(&corners) + v / v.length().max(1.0) * ln
+                let v = *p - c;
+                let ln = v.length().max(1.0) + infl;
+                c + v / v.length().max(1.0) * ln
             })
             .map(|p| p + off)
             .collect();
         painter.add(egui::Shape::convex_polygon(
             pts,
-            Color32::from_black_alpha(*alpha + (14.0 * l) as u8),
+            Color32::from_black_alpha(alpha + (14.0 * l) as u8),
             egui::Stroke::NONE,
         ));
     }
@@ -1373,20 +1315,18 @@ fn paint_paper(
     let cut = if ear_idx == 2 { 0.15 } else { 0.0 };
     let s_from = b_from + edge * cut;
     let s_to = b_from + edge * 0.92;
-    let strips = [0.0f32, 2.5, 5.5, 9.0];
-    let s_alphas = [26u8, 17, 10, 5];
-    for (o, alpha) in strips.iter().zip(s_alphas.iter()) {
+    for (o, alpha) in [(0.0f32, 26u8), (2.5, 17), (5.5, 10), (9.0, 5)] {
         let a = s_from + vec2(0.0, o + 2.0 * l);
         let b = s_to + vec2(1.5, o + 2.0 * l);
         painter.add(egui::Shape::convex_polygon(
             vec![a, b, b + vec2(1.5, 3.5), a + vec2(1.5, 3.0)],
-            Color32::from_black_alpha(*alpha + (14.0 * l) as u8),
+            Color32::from_black_alpha(alpha + (14.0 * l) as u8),
             egui::Stroke::NONE,
         ));
     }
 
     // the card: opaque grain tile × per-corner shading (fake gradient);
-    // the curled corner is replaced by the fold crease midpoint
+    // the curled corner is replaced by the crease midpoint (a notch)
     let ns = 46.0;
     let uvs = [
         pos2(0.0, 0.0),
@@ -1408,7 +1348,7 @@ fn paint_paper(
     mesh.indices.extend([0u32, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
 
-    // the folded-back ear (paper backside, very shallow)
+    // the folded-back ear: whisper shallow, paper backside
     painter.add(egui::Shape::convex_polygon(
         vec![e1, apex, e2],
         tinted(fill, 0.88),
@@ -1416,16 +1356,6 @@ fn paint_paper(
     ));
 }
 
-fn card_center_of(corners: &[Pos2; 4]) -> Pos2 {
-    let mut c = Pos2::ZERO;
-    for p in corners {
-        c.x += p.x * 0.25;
-        c.y += p.y * 0.25;
-    }
-    c
-}
-
-/// Inline note editors commit on: Esc, focus loss, or a click outside the card.
 fn editor_should_commit(ui: &Ui, resp: &egui::Response, rect: Rect) -> bool {
     let escaped = ui.input(|i| i.key_pressed(Key::Escape));
     if escaped {
