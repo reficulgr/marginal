@@ -549,8 +549,10 @@ impl Reader {
             if last_chap_x.map(|lx| (lx - x).abs() < 1.5).unwrap_or(false) {
                 continue;
             }
+            // twice the height of everything else on the ruler — exaggerated
+            // on purpose: the chapter skeleton should read from across the room
             painter.line_segment(
-                [pos2(x, ruler.bottom()), pos2(x, ruler.bottom() - 26.0)],
+                [pos2(x, ruler.bottom()), pos2(x, ruler.bottom() - 52.0)],
                 Stroke::new(0.6, crate::theme::CHAPTER_MARK),
             );
             last_chap_x = Some(x);
