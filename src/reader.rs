@@ -163,10 +163,11 @@ impl Reader {
     /// Give legacy post-its (anchor-only) a hung card position, and stack
     /// cards on the same side so they don't overlap.
     /// Auto-hug: positions for every post-it card that has no user-set
-    /// position in the CURRENT view mode — hung just outside a page edge,
-    /// stacked per side. In spread (book) view cards always hang toward the
-    /// OUTER edge of the spread (the spine stays clean); `outer_left`
-    /// selects it for the sheet. Single view hangs by pin position.
+    /// position in the CURRENT view mode. The card hangs outside whichever
+    /// page edge is CLOSEST to its pin (left / right / top / bottom),
+    /// stacking outward along that edge. In spread (book) view the spine
+    /// side is excluded — left sheets hang {left, top, bottom},
+    /// right sheets {right, top, bottom} — so nothing sits in the gutter.
     fn compute_auto_hangs(
         &self,
         page_anns: &[Annotation],
@@ -179,21 +180,29 @@ impl Reader {
         let ph = page_rect.height().max(1.0);
         let mut left_stack: Vec<f32> = Vec::new();
         let mut right_stack: Vec<f32> = Vec::new();
+        let mut top_stack: Vec<f32> = Vec::new();
+        let mut bottom_stack: Vec<f32> = Vec::new();
 
-        // pass 1: register user-placed cards (current mode) as fixed
+        // pass 1: register user-placed cards by which margin they occupy
         for ann in page_anns {
-            let Anchor::PostIt { x, card, card_s, .. } = ann.anchor else { continue };
+            let Anchor::PostIt { card, card_s, size, .. } = ann.anchor else { continue };
             let user_slot = if self.facing { card_s } else { card };
-            if let Some([_, cy]) = user_slot {
-                if x <= 0.5 {
-                    left_stack.push(cy);
-                } else {
-                    right_stack.push(cy);
-                }
+            let Some([cx, cy]) = user_slot else { continue };
+            let [w, h] = size.unwrap_or(default_size);
+            let w_frac = (w / pw).max(0.04);
+            let h_frac = (h / ph).max(0.05);
+            if cy + h_frac <= 0.07 {
+                top_stack.push(cx);
+            } else if cy >= 0.93 {
+                bottom_stack.push(cx);
+            } else if cx + w_frac <= 0.07 {
+                left_stack.push(cy);
+            } else if cx >= 0.93 {
+                right_stack.push(cy);
             }
         }
 
-        // pass 2: hang autos in creation order, flowing past whatever exists
+        // pass 2: hang the rest by nearest allowed edge
         for ann in page_anns {
             let Anchor::PostIt {
                 x,
@@ -214,28 +223,74 @@ impl Reader {
                     let [w, h] = size.unwrap_or(default_size);
                     let w = w.max(default_size[0]);
                     let h = h.max(default_size[1]);
-                    // side: book mode → outer edge of the spread; single → pin position
-                    let left = match outer_left {
-                        Some(outer) => outer,
-                        None => x <= 0.5,
-                    };
-                    let cx = if left { -(w + 18.0) / pw } else { 1.0 + 18.0 / pw };
-                    let stack = if left { &left_stack } else { &right_stack };
-                    let h_frac = (h + 10.0) / ph;
-                    let mut y_c = (y - h_frac * 0.4).clamp(-0.15, 1.1 - h_frac);
-                    for _ in 0..40 {
-                        if !stack.iter().any(|&oy| (oy - y_c).abs() < h_frac + 0.012) {
-                            break;
+                    let w_frac = (w / pw).max(0.04);
+                    let h_frac = (h / ph).max(0.05);
+
+                    // nearest edge, spine excluded in book view
+                    enum Side {
+                        L,
+                        R,
+                        T,
+                        B,
+                    }
+                    let d_left = x;
+                    let d_right = 1.0 - x;
+                    let d_top = y;
+                    let d_bottom = 1.0 - y;
+                    let side = match outer_left {
+                        Some(true) => {
+                            if d_top <= d_left.min(d_bottom) {
+                                Side::T
+                            } else if d_bottom <= d_left {
+                                Side::B
+                            } else {
+                                Side::L
+                            }
                         }
-                        y_c += h_frac + 0.012;
+                        Some(false) => {
+                            if d_top <= d_right.min(d_bottom) {
+                                Side::T
+                            } else if d_bottom <= d_right {
+                                Side::B
+                            } else {
+                                Side::R
+                            }
+                        }
+                        None => {
+                            if d_left <= d_right && d_left <= d_top && d_left <= d_bottom {
+                                Side::L
+                            } else if d_right <= d_top && d_right <= d_bottom {
+                                Side::R
+                            } else if d_top <= d_bottom {
+                                Side::T
+                            } else {
+                                Side::B
+                            }
+                        }
+                    };
+
+                    match side {
+                        Side::L => {
+                            let cx = -(w + 18.0) / pw;
+                            let cy = stack_along_h(y, &mut left_stack, h_frac);
+                            out.insert(ann.id.clone(), [cx, cy]);
+                        }
+                        Side::R => {
+                            let cx = 1.0 + 18.0 / pw;
+                            let cy = stack_along_h(y, &mut right_stack, h_frac);
+                            out.insert(ann.id.clone(), [cx, cy]);
+                        }
+                        Side::T => {
+                            let cy = -(h + 16.0) / ph;
+                            let cx = stack_along_v(x, &mut top_stack, w_frac);
+                            out.insert(ann.id.clone(), [cx, cy]);
+                        }
+                        Side::B => {
+                            let cy = 1.0 + 16.0 / ph;
+                            let cx = stack_along_v(x, &mut bottom_stack, w_frac);
+                            out.insert(ann.id.clone(), [cx, cy]);
+                        }
                     }
-                    let cy = y_c.min(1.12 - h_frac).max(-0.18);
-                    if left {
-                        left_stack.push(cy);
-                    } else {
-                        right_stack.push(cy);
-                    }
-                    out.insert(ann.id.clone(), [cx, cy]);
                 }
             }
         }
@@ -1476,6 +1531,36 @@ impl Reader {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Stacking along a horizontal margin (top/bottom hangs): slide sideways
+/// past neighbors, clamped to stay above/below the page's width.
+fn stack_along_v(x_pin: f32, stack: &mut Vec<f32>, w_frac: f32) -> f32 {
+    let mut x_c = (x_pin - w_frac * 0.45).clamp(-0.08, 1.08 - w_frac);
+    for _ in 0..40 {
+        if !stack.iter().any(|&ox| (ox - x_c).abs() < w_frac + 0.014) {
+            break;
+        }
+        x_c += w_frac + 0.014;
+    }
+    let pushed = x_c.min(1.12 - w_frac).max(-0.18);
+    stack.push(pushed);
+    pushed
+}
+
+/// Stacking along a vertical margin (left/right hangs): slide downward
+/// past neighbors.
+fn stack_along_h(y_pin: f32, stack: &mut Vec<f32>, h_frac: f32) -> f32 {
+    let mut y_c = (y_pin - h_frac * 0.4).clamp(-0.16, 1.1 - h_frac);
+    for _ in 0..40 {
+        if !stack.iter().any(|&oy| (oy - y_c).abs() < h_frac + 0.012) {
+            break;
+        }
+        y_c += h_frac + 0.012;
+    }
+    let pushed = y_c.min(1.12 - h_frac).max(-0.18);
+    stack.push(pushed);
+    pushed
+}
 
 /// Stable 0..1 pseudo-random from an id (per-note look, no shimmer).
 fn hash01(v: u64) -> f32 {
