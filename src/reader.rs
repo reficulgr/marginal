@@ -460,14 +460,6 @@ impl Reader {
                 });
         }
 
-        // page ruler (bottom): 2% steps, click / drag to jump
-        egui::Panel::bottom("reader_ruler")
-            .exact_size(30.0)
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| {
-                self.page_ruler(ui);
-            });
-
         // canvas
         egui::CentralPanel::default().show(ui, |ui| {
             self.canvas(ui);
@@ -478,52 +470,55 @@ impl Reader {
     // Canvas
     // ==================================================================
 
-    /// Bottom ruler: a strip of tick marks, one every 2% of the page span
-    /// (longer every 10%), a red marker for the current position, and
-    /// click / drag-to-scrub navigation.
+    /// Bottom ruler: floats transparently over the desk (the dot grid shows
+    /// through), ~90% of the available width, ticks every 2% of the page
+    /// span (longer every 10%), red position bracket, click / drag-scrub.
     fn page_ruler(&mut self, ui: &mut Ui) {
-        let (rect, resp) =
-            ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click_and_drag());
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::ZERO, crate::theme::CHROME_BG);
-        painter.line_segment(
-            [pos2(rect.left(), rect.top()), pos2(rect.right(), rect.top())],
-            Stroke::new(1.0, Color32::from_rgb(70, 74, 82)),
+        let avail = ui.max_rect();
+        let w = avail.width() * 0.9;
+        let ruler = Rect::from_min_size(
+            pos2(avail.left() + (avail.width() - w) * 0.5, avail.bottom() - 32.0),
+            vec2(w, 24.0),
         );
+        let ruler_id = egui::Id::unique(("reader-ruler", self.book.id));
+        let resp = ui.interact(ruler, ruler_id, Sense::click_and_drag());
+        let painter = ui.painter().clone();
 
         let count = self.page_count.max(1);
         let pad = 10.0;
-        let w = (rect.width() - 2.0 * pad).max(1.0);
-        let fx = |frac: f32| -> f32 { rect.left() + pad + frac * w };
+        let tw = (ruler.width() - 2.0 * pad).max(1.0);
+        let fx = |frac: f32| -> f32 { ruler.left() + pad + frac * tw };
         let page_at = |frac: f32| -> u32 {
             (1.0 + frac * (count as f32 - 1.0)).round().clamp(1.0, count as f32) as u32
         };
 
-        // tick marks: minor every 2%, major every 10% with page labels
         let mut pct = 0.0f32;
         while pct <= 100.001 {
             let frac = pct / 100.0;
             let x = fx(frac);
             let major = (pct as i32) % 10 == 0;
-            let tick_h = if major { 12.0 } else { 6.0 };
+            let tick_h = if major { 13.0 } else { 6.0 };
+            let tick_c = if major {
+                Color32::from_rgb(168, 172, 180)
+            } else {
+                Color32::from_rgb(112, 116, 124)
+            };
             painter.line_segment(
-                [pos2(x, rect.bottom()), pos2(x, rect.bottom() - tick_h)],
-                Stroke::new(1.0, Color32::from_rgb(110, 114, 122)),
+                [pos2(x, ruler.bottom()), pos2(x, ruler.bottom() - tick_h)],
+                Stroke::new(1.0, tick_c),
             );
             if major && count > 20 {
-                let page = page_at(frac);
                 painter.text(
-                    pos2(x, rect.top() + 2.0),
+                    pos2(x, ruler.top()),
                     Align2::CENTER_TOP,
-                    page.to_string(),
+                    page_at(frac).to_string(),
                     FontId::proportional(9.0),
-                    Color32::from_rgb(140, 144, 152),
+                    Color32::from_rgb(150, 154, 162),
                 );
             }
             pct += 2.0;
         }
 
-        // current position marker (a small red bracket over the page span)
         let marker_pages: Vec<u32> = if self.facing {
             let (l, r) = self.spread_pair();
             [l, r].into_iter().flatten().collect()
@@ -542,21 +537,21 @@ impl Reader {
             let b = fx(frac_of(*last));
             painter.rect_filled(
                 Rect::from_min_max(
-                    pos2(a - 2.0, rect.top() + 4.0),
-                    pos2(b + 2.0, rect.bottom() - 2.0),
+                    pos2(a - 2.0, ruler.top() + 3.0),
+                    pos2(b + 2.0, ruler.bottom() - 2.0),
                 ),
                 CornerRadius::same(2),
-                Color32::from_rgba_unmultiplied(226, 72, 72, 200),
+                Color32::from_rgba_unmultiplied(226, 72, 72, 190),
             );
         }
 
-        // click / drag-scrub navigation
         if resp.clicked() || resp.dragged() {
             if resp.dragged() {
-                self.scrub_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(450));
+                self.scrub_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(450));
             }
             if let Some(p) = resp.hover_pos().or(ui.input(|i| i.pointer.interact_pos())) {
-                let frac = ((p.x - pad - rect.left()) / w).clamp(0.0, 1.0);
+                let frac = ((p.x - pad - ruler.left()) / tw).clamp(0.0, 1.0);
                 let target = page_at(frac);
                 if target != self.page {
                     self.go_to_page(target);
@@ -565,26 +560,25 @@ impl Reader {
             }
         }
 
-        // hover: preview the page under the pointer
         if resp.hovered() && !resp.dragged() {
             if let Some(p) = resp.hover_pos() {
-                let frac = ((p.x - pad - rect.left()) / w).clamp(0.0, 1.0);
+                let frac = ((p.x - pad - ruler.left()) / tw).clamp(0.0, 1.0);
                 let preview = page_at(frac);
                 let label_rect = Rect::from_min_size(
-                    pos2((p.x - 18.0).max(rect.left()), rect.top() + 1.0),
-                    vec2(36.0, 14.0),
+                    pos2((p.x - 18.0).max(ruler.left()), ruler.top() - 18.0),
+                    vec2(36.0, 15.0),
                 );
                 painter.rect_filled(
                     label_rect,
                     CornerRadius::same(3),
-                    Color32::from_rgb(60, 64, 72),
+                    Color32::from_rgb(58, 62, 70),
                 );
                 painter.text(
                     label_rect.center(),
                     Align2::CENTER_CENTER,
                     format!("p.{preview}"),
                     FontId::proportional(9.0),
-                    Color32::from_rgb(220, 222, 226),
+                    Color32::from_rgb(225, 227, 231),
                 );
             }
         }
@@ -768,6 +762,9 @@ impl Reader {
                 self.link_dialog = Some(dialog);
             }
         }
+
+        // page ruler: floats transparently over the desk, ~90% window width
+        self.page_ruler(ui);
     }
 
     /// One physical page on the desk: shadow, paper, texture, interaction,
