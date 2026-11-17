@@ -1,0 +1,168 @@
+//! App shell: wires library + reader screens, owns the store and scan worker.
+
+use std::sync::{mpsc::Receiver, Arc, Mutex};
+
+use crate::library::Library;
+use crate::reader::Reader;
+use crate::scan::{self, ScanMsg};
+use crate::store::{SharedStore, Store};
+
+#[derive(Clone)]
+pub enum ScanStatus {
+    Idle,
+    Scanning {
+        done: usize,
+        total: usize,
+        current: String,
+    },
+    Thumbs,
+    Done(Vec<String>),
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Library,
+    Reader,
+}
+
+pub struct GlossaApp {
+    store: SharedStore,
+    mode: Mode,
+    library: Library,
+    reader: Option<Reader>,
+    scan_rx: Option<Receiver<ScanMsg>>,
+    status: ScanStatus,
+    errors_pending: Vec<String>,
+}
+
+impl GlossaApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let store = Store::open_default()?;
+        let last = store.get_meta("last_folder")?;
+        let store: SharedStore = Arc::new(Mutex::new(store));
+
+        let mut library = Library::new(store.clone());
+        if let Some(f) = last.clone() {
+            library.set_folder(f);
+        }
+
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
+        Ok(GlossaApp {
+            store,
+            mode: Mode::Library,
+            library,
+            reader: None,
+            scan_rx: None,
+            status: ScanStatus::Idle,
+            errors_pending: Vec::new(),
+        })
+    }
+
+    fn start_scan(&mut self, folder: String) {
+        self.status = ScanStatus::Scanning {
+            done: 0,
+            total: 0,
+            current: String::new(),
+        };
+        self.scan_rx = Some(scan::spawn_scan(self.store.clone(), folder.into()));
+    }
+
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.scan_rx else { return };
+        let mut repaint = false;
+        let mut done_now = None;
+        while let Ok(msg) = rx.try_recv() {
+            repaint = true;
+            match msg {
+                ScanMsg::Progress { done, total, current } => {
+                    self.status = ScanStatus::Scanning { done, total, current };
+                }
+                ScanMsg::ScanningThumbs | ScanMsg::Thumb { .. } => {
+                    self.status = ScanStatus::Thumbs;
+                }
+                ScanMsg::Done { errors } => {
+                    done_now = Some(errors);
+                }
+            }
+        }
+        if let Some(errors) = done_now {
+            self.errors_pending.extend(errors);
+            self.status = ScanStatus::Done(std::mem::take(&mut self.errors_pending));
+            self.scan_rx = None;
+        }
+        if repaint {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl eframe::App for GlossaApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_scan(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_scan(ui.ctx());
+
+        match self.mode {
+            Mode::Library => {
+                let status = self.status.clone();
+                self.library.show(ui, &status);
+
+                if let Some(f) = self.library.folder_request.take() {
+                    crate::store::with_store(&self.store, |s| s.set_meta("last_folder", &f)).ok();
+                    self.library.set_folder(f.clone());
+                    self.start_scan(f);
+                }
+                if let Some(f) = self.library.rescan_request.take() {
+                    self.start_scan(f);
+                }
+                if let Some(id) = self.library.open_request.take() {
+                    match crate::store::with_store(&self.store, |s| s.book_by_id(id)) {
+                        Ok(book) => {
+                            self.reader = Some(Reader::open(self.store.clone(), book));
+                            self.mode = Mode::Reader;
+                            ui.ctx().request_repaint();
+                        }
+                        Err(e) => self.library.error = Some(format!("opening failed: {e}")),
+                    }
+                }
+            }
+            Mode::Reader => {
+                if !self.reader.is_some() {
+                    self.mode = Mode::Library;
+                    return;
+                }
+
+                let mut back = false;
+                let jump: Option<(i64, u32)> = {
+                    let Some(reader) = self.reader.as_mut() else {
+                        self.mode = Mode::Library;
+                        return;
+                    };
+                    reader.show(ui, &mut || back = true);
+                    reader.pending_jump.take()
+                };
+
+                // cross-book navigation from links
+                if let Some((new_id, page)) = jump {
+                    if let Ok(book) =
+                        crate::store::with_store(&self.store, |s| s.book_by_id(new_id))
+                    {
+                        let mut nr = Reader::open(self.store.clone(), book);
+                        nr.go_to_page(page);
+                        self.reader = Some(nr);
+                    }
+                }
+
+                if back {
+                    self.reader = None;
+                    self.mode = Mode::Library;
+                }
+            }
+        }
+    }
+}

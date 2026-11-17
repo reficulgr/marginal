@@ -1,0 +1,173 @@
+//! Data model: books, annotations, links. No egui dependency here.
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// Book file formats
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BookFormat {
+    Pdf,
+    Epub,
+    Mobi,
+    Azw3,
+    Fb2,
+    Djvu,
+    Cbz,
+    Other,
+}
+
+impl BookFormat {
+    pub fn from_path(p: &Path) -> BookFormat {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "pdf" => BookFormat::Pdf,
+            "epub" => BookFormat::Epub,
+            "mobi" => BookFormat::Mobi,
+            "azw3" | "prc" => BookFormat::Azw3,
+            "fb2" => BookFormat::Fb2,
+            "djvu" | "djv" => BookFormat::Djvu,
+            "cbz" => BookFormat::Cbz,
+            _ => BookFormat::Other,
+        }
+    }
+
+    /// Label shown in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            BookFormat::Pdf => "PDF",
+            BookFormat::Epub => "EPUB",
+            BookFormat::Mobi => "MOBI",
+            BookFormat::Azw3 => "AZW3",
+            BookFormat::Fb2 => "FB2",
+            BookFormat::Djvu => "DJVU",
+            BookFormat::Cbz => "CBZ",
+            BookFormat::Other => "FILE",
+        }
+    }
+
+    /// Formats this build can actually open and render (M1: PDF only).
+    pub fn renderable(self) -> bool {
+        matches!(self, BookFormat::Pdf)
+    }
+
+    /// Everything we index in a library folder scan.
+    pub fn known(self) -> bool {
+        !matches!(self, BookFormat::Other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Books
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // author/size/mtime feed future metadata UI
+pub struct BookMeta {
+    pub id: i64,
+    /// content sha256 (hex) — the stable identity of a book, sidecar-friendly
+    pub fingerprint: String,
+    pub path: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub format: BookFormat,
+    pub page_count: Option<u32>,
+    pub size_bytes: i64,
+    pub mtime: i64,
+    pub has_thumb: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Annotations
+// ---------------------------------------------------------------------------
+
+pub type AnnotationId = String; // uuid v4
+
+/// Where an annotation is anchored on a page.
+/// Coordinates are normalized (0..1) relative to the *rendered page box*,
+/// so annotations survive zooming and resolution changes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Anchor {
+    /// Sticky note pinned onto the page. (x, y) = top-left corner of the card.
+    PostIt { x: f32, y: f32 },
+    /// Marginal note hanging beside the page, at this vertical position.
+    Margin { y: f32 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Annotation {
+    pub id: AnnotationId,
+    pub page: u32, // 1-based
+    pub anchor: Anchor,
+    pub body: String,
+    pub color: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Link targets
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum LinkTarget {
+    /// Another annotation, anywhere in the library.
+    Annotation(String),
+    /// A page of another book (identified by fingerprint — survives moves).
+    Page { book: String, page: u32 },
+    /// External resource.
+    Url(String),
+}
+
+// ---------------------------------------------------------------------------
+// Sticky-note colors
+// ---------------------------------------------------------------------------
+
+pub const NOTE_COLORS: [(&str, [u8; 3]); 5] = [
+    ("yellow", [254, 233, 129]),
+    ("pink", [250, 179, 203]),
+    ("blue", [167, 213, 245]),
+    ("green", [174, 229, 152]),
+    ("orange", [250, 197, 142]),
+];
+
+pub fn note_color_parts(name: &str) -> [u8; 3] {
+    NOTE_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(NOTE_COLORS[0].1)
+}
+
+pub fn next_note_color(name: &str) -> String {
+    let idx = NOTE_COLORS
+        .iter()
+        .position(|(n, _)| *n == name)
+        .map(|i| (i + 1) % NOTE_COLORS.len())
+        .unwrap_or(0);
+    NOTE_COLORS[idx].0.to_string()
+}
+
+/// A slightly darker variant of a note color, for borders / connectors.
+pub fn darker_parts(c: [u8; 3], factor: f32) -> [u8; 3] {
+    [
+        (c[0] as f32 * factor) as u8,
+        (c[1] as f32 * factor) as u8,
+        (c[2] as f32 * factor) as u8,
+    ]
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
