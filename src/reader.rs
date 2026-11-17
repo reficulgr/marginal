@@ -31,6 +31,8 @@ pub struct EditingNote {
 
 pub struct PageTex {
     pub tex: egui::TextureHandle,
+    /// pixel width it was rendered at (for the quality ladder upgrade)
+    pub quality: u32,
 }
 
 pub struct Reader {
@@ -47,6 +49,10 @@ pub struct Reader {
     pan: Vec2,
     /// book (facing pages) mode
     facing: bool,
+    /// last time the page changed (for the scrub quality ladder)
+    last_page_jump: Option<std::time::Instant>,
+    /// while a ruler drag is active, keep rendering cheap previews
+    scrub_until: Option<std::time::Instant>,
     /// paper grain texture, generated once
     grain: std::collections::HashMap<String, egui::TextureHandle>,
     /// blurred shadow sprite, generated once
@@ -91,6 +97,8 @@ impl Reader {
             page_tex_cache: Default::default(),
             annotations,
             pan: Vec2::ZERO,
+            last_page_jump: None,
+            scrub_until: None,
             grain: Default::default(),
             shadow: None,
             armed: None,
@@ -158,6 +166,7 @@ impl Reader {
 
     pub fn go_to_page(&mut self, page: u32) {
         self.page = self.anchor_for_mode(page.clamp(1, self.page_count.max(1)), self.facing);
+        self.last_page_jump = Some(std::time::Instant::now());
     }
 
     /// Give legacy post-its (anchor-only) a hung card position, and stack
@@ -543,6 +552,9 @@ impl Reader {
 
         // click / drag-scrub navigation
         if resp.clicked() || resp.dragged() {
+            if resp.dragged() {
+                self.scrub_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(450));
+            }
             if let Some(p) = resp.hover_pos().or(ui.input(|i| i.pointer.interact_pos())) {
                 let frac = ((p.x - pad - rect.left()) / w).clamp(0.0, 1.0);
                 let target = page_at(frac);
@@ -857,13 +869,33 @@ impl Reader {
     }
 
     fn ensure_page_texture(&mut self, ctx: &egui::Context, page_no: u32) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.page_tex_cache.get(&page_no) {
-            return Some(t.tex.clone());
-        }
-        let doc = self.doc.as_ref()?;
-        let quality: u32 = (ctx.pixels_per_point() * 1.7)
+        // quality ladder: while scrubbing (or just after a jump) render a
+        // cheap preview; upgrade to full quality once things settle
+        let now = std::time::Instant::now();
+        let scrub_recent = self
+            .scrub_until
+            .map(|t| now < t)
+            .unwrap_or(false)
+            || self
+                .last_page_jump
+                .map(|t| now.duration_since(t) < std::time::Duration::from_millis(320))
+                .unwrap_or(false);
+        let full_q: u32 = (ctx.pixels_per_point() * 1.7)
             .max(1100.0)
             .min(2000.0) as u32;
+        let target_q = if scrub_recent { full_q.min(520) } else { full_q };
+
+        if let Some(t) = self.page_tex_cache.get(&page_no) {
+            if t.quality >= target_q {
+                return Some(t.tex.clone());
+            }
+            if scrub_recent && t.quality >= 400 {
+                return Some(t.tex.clone()); // good enough mid-scrub
+            }
+            // else: fall through and re-render — the settle upgrade
+        }
+        let doc = self.doc.as_ref()?;
+        let quality = target_q;
         let img: PageImage = match doc.render((page_no - 1) as u32, quality) {
             Ok(img) => img,
             Err(e) => {
@@ -881,7 +913,7 @@ impl Reader {
             egui::TextureOptions::LINEAR,
         );
         self.page_tex_cache
-            .insert(page_no, PageTex { tex: tex.clone() });
+            .insert(page_no, PageTex { tex: tex.clone(), quality });
         while self.page_tex_cache.len() > 6 {
             let victim = self
                 .page_tex_cache
