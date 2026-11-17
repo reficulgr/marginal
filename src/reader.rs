@@ -47,6 +47,8 @@ pub struct Reader {
     pan: Vec2,
     /// paper grain texture, generated once
     grain: std::collections::HashMap<String, egui::TextureHandle>,
+    /// blurred shadow sprite, generated once
+    shadow: Option<egui::TextureHandle>,
 
     /// armed "click on page to add" mode
     armed: Option<ArmMode>,
@@ -78,6 +80,7 @@ impl Reader {
             annotations,
             pan: Vec2::ZERO,
             grain: Default::default(),
+            shadow: None,
             armed: None,
             editing: None,
             link_dialog: None,
@@ -529,6 +532,31 @@ impl Reader {
         Some(tex)
     }
 
+    /// Blurred shadow sprite: radial gaussian alpha, tinted at draw time.
+    fn ensure_shadow(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(t) = &self.shadow {
+            return t.clone();
+        }
+        let s = 160usize;
+        let c = (s as f32 - 1.0) / 2.0;
+        let sigma = 30.0f32;
+        let mut px = Vec::with_capacity(s * s * 4);
+        for y in 0..s {
+            for x in 0..s {
+                let dx = x as f32 - c;
+                let dy = y as f32 - c;
+                let d2 = dx * dx + dy * dy;
+                let p = (-(d2) / (2.0 * sigma * sigma)).exp();
+                let a = (255.0 * 0.36 * p) as u8;
+                px.extend([0u8, 0, 0, a]);
+            }
+        }
+        let ci = egui::ColorImage::from_rgba_unmultiplied([s, s], &px);
+        let tex = ctx.load_texture("glossa-shadow", ci, egui::TextureOptions::LINEAR);
+        self.shadow = Some(tex.clone());
+        tex
+    }
+
     /// Procedural paper-grain tile, per note color: card color with baked
     /// luminance wobble and sparse flecks — OPAQUE, so the paper is solid.
     fn ensure_grain(&mut self, ctx: &egui::Context, color: [u8; 3]) -> egui::TextureHandle {
@@ -682,11 +710,16 @@ impl Reader {
         ui.advance_cursor_after_rect(pin_rect);
         let pin_resp = ui.interact(pin_rect, pin_id, Sense::click_and_drag());
 
-        // ----- pencil thread, quite transparent -----
+        // ----- pencil thread — turns red while this note is being edited -----
         if !card.contains(pin_pos) {
             let attach = edge_point_toward(card, pin_pos);
             let seed = egui::util::hash((ann.id.clone(), "thread"));
-            links::hand_dashed_line(&ui.painter().clone(), pin_pos, attach, seed, crate::theme::postit_thread());
+            let thread_color = if editing_this {
+                crate::theme::PIN_RED
+            } else {
+                crate::theme::postit_thread()
+            };
+            links::hand_dashed_line(&ui.painter().clone(), pin_pos, attach, seed, thread_color);
         }
         let pin_radius = if pin_resp.hovered() || pin_resp.dragged() { 6.5 } else { 4.5 };
         ui.painter().circle_filled(pin_pos, pin_radius, crate::theme::PIN_RED);
@@ -711,9 +744,18 @@ impl Reader {
         let grip_resp = ui.interact(grip_rect, grip_id, Sense::click_and_drag());
 
         let grain = self.ensure_grain(ui.ctx(), card_fill);
+        let shadow = self.ensure_shadow(ui.ctx());
         let painter = ui.painter().clone();
         let lifted = resp.dragged();
-        paint_paper(&painter, card, egui::util::hash(ann.id.clone()), card_fill, &grain, lifted);
+        paint_paper(
+            &painter,
+            card,
+            egui::util::hash(ann.id.clone()),
+            card_fill,
+            &grain,
+            &shadow,
+            lifted,
+        );
         if editing.is_some() {
             // mark the writing area with the pin color ring while typing
             ui.painter().rect_stroke(
@@ -1244,8 +1286,7 @@ fn tinted(c: [u8; 3], factor: f32) -> Color32 {
 /// Paper silhouette: the card's four corners, tilted and jittered per seed.
 fn paper_corners(card: Rect, seed: u64, scale: f32) -> [Pos2; 4] {
     let c = card.center();
-    let theta = (hash01(seed) - 0.5) * 0.035; // ±~1° tilt
-    let (sn, cs) = (theta.sin(), theta.cos());
+    let theta = (hash01(seed) - 0.5) * 0.0803; // ±2.3° tilt
     let base = [
         card.left_top(),
         card.right_top(),
@@ -1255,10 +1296,11 @@ fn paper_corners(card: Rect, seed: u64, scale: f32) -> [Pos2; 4] {
     let mut out = [pos2(0.0, 0.0); 4];
     for (i, b) in base.iter().enumerate() {
         let v = *b - c;
-        let rx = v.x * cs - v.y * sn;
-        let ry = v.x * sn + v.y * cs;
-        let jitter = (hash01(seed + (i as u64 + 7) * 977) - 0.5) * 0.012 + 1.0;
-        out[i] = pos2(c.x + rx * jitter * scale, c.y + ry * jitter * scale);
+        // per-corner orthogonality slop, capped at ±1°
+        let eps = (hash01(seed + (i as u64 + 7) * 977) - 0.5) * 0.0349;
+        let a = theta + eps;
+        let (sn, cs) = (a.sin(), a.cos());
+        out[i] = pos2(c.x + (v.x * cs - v.y * sn) * scale, c.y + (v.x * sn + v.y * cs) * scale);
     }
     out
 }
@@ -1271,62 +1313,36 @@ fn paint_paper(
     seed: u64,
     fill: [u8; 3],
     grain: &egui::TextureHandle,
+    shadow: &egui::TextureHandle,
     lifted: bool,
 ) {
     let scale = if lifted { 1.04 } else { 1.0 };
     let corners = paper_corners(card, seed, scale);
-    let ear_idx = ((hash01(seed ^ 0xA5A5_A5A5) * 4.0) as usize) % 4;
-    let d = 7.0;
 
-    // fold crease along the curl's two edges
-    let n1 = (ear_idx + 3) % 4;
-    let n2 = (ear_idx + 1) % 4;
-    let v1 = corners[n1] - corners[ear_idx];
-    let e1 = corners[ear_idx] + v1 * (d / v1.length().max(1.0));
-    let v2 = corners[n2] - corners[ear_idx];
-    let e2 = corners[ear_idx] + v2 * (d / v2.length().max(1.0));
-    let mid = Pos2::new((e1.x + e2.x) * 0.5, (e1.y + e2.y) * 0.5);
-    let apex = mid + (card.center() - mid) * 0.3;
-
-    // ambient shadow: layered translucent quads → feathered edge
+    // blurred shadow: ONE soft gaussian sprite under an inflated quad
     let l = if lifted { 1.0 } else { 0.0 };
-    let off = vec2(2.0 + 4.0 * l, 3.0 + 5.0 * l);
-    for (infl, alpha) in [(2.0f32, 13u8), (4.5, 11), (7.5, 9), (11.5, 7), (16.0, 5)] {
-        let c = card.center();
-        let pts: Vec<Pos2> = corners
-            .iter()
-            .map(|p| {
-                let v = *p - c;
-                let ln = v.length().max(1.0) + infl;
-                c + v / v.length().max(1.0) * ln
-            })
-            .map(|p| p + off)
-            .collect();
-        painter.add(egui::Shape::convex_polygon(
-            pts,
-            Color32::from_black_alpha(alpha + (14.0 * l) as u8),
-            egui::Stroke::NONE,
-        ));
+    let off = vec2(2.0 + 3.0 * l, 3.5 + 5.0 * l);
+    let inflate = 22.0 + 9.0 * l;
+    let q = card.expand2(vec2(inflate, inflate));
+    let mut sm = egui::Mesh::default();
+    sm.texture_id = shadow.id();
+    let vc = Color32::from_black_alpha(if lifted { 255 } else { 225 });
+    for (pos, uv) in [
+        (q.left_top(), pos2(0.0, 0.0)),
+        (q.right_top(), pos2(1.0, 0.0)),
+        (q.right_bottom(), pos2(1.0, 1.0)),
+        (q.left_bottom(), pos2(0.0, 1.0)),
+    ] {
+        sm.vertices.push(egui::epaint::Vertex {
+            pos: pos + off,
+            color: vc,
+            uv,
+        });
     }
+    sm.indices.extend([0u32, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(sm));
 
-    // contact shadow: feathered strips under the bottom edge
-    let (b_from, b_to) = (corners[3], corners[2]);
-    let edge = b_to - b_from;
-    let cut = if ear_idx == 2 { 0.15 } else { 0.0 };
-    let s_from = b_from + edge * cut;
-    let s_to = b_from + edge * 0.92;
-    for (o, alpha) in [(0.0f32, 26u8), (2.5, 17), (5.5, 10), (9.0, 5)] {
-        let a = s_from + vec2(0.0, o + 2.0 * l);
-        let b = s_to + vec2(1.5, o + 2.0 * l);
-        painter.add(egui::Shape::convex_polygon(
-            vec![a, b, b + vec2(1.5, 3.5), a + vec2(1.5, 3.0)],
-            Color32::from_black_alpha(alpha + (14.0 * l) as u8),
-            egui::Stroke::NONE,
-        ));
-    }
-
-    // the card: opaque grain tile × per-corner shading (fake gradient);
-    // the curled corner is replaced by the crease midpoint (a notch)
+    // the card: opaque grain tile × per-corner shading (fake gradient)
     let ns = 46.0;
     let uvs = [
         pos2(0.0, 0.0),
@@ -1338,22 +1354,14 @@ fn paint_paper(
     let mut mesh = egui::Mesh::default();
     mesh.texture_id = grain.id();
     for (i, pt) in corners.iter().enumerate() {
-        let pt = if i == ear_idx { mid } else { *pt };
         mesh.vertices.push(egui::epaint::Vertex {
-            pos: pt,
+            pos: *pt,
             color: tinted(fill, shade[i]),
             uv: uvs[i],
         });
     }
     mesh.indices.extend([0u32, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
-
-    // the folded-back ear: whisper shallow, paper backside
-    painter.add(egui::Shape::convex_polygon(
-        vec![e1, apex, e2],
-        tinted(fill, 0.88),
-        egui::Stroke::new(0.8, tinted(fill, 0.72)),
-    ));
 }
 
 fn editor_should_commit(ui: &Ui, resp: &egui::Response, rect: Rect) -> bool {
