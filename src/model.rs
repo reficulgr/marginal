@@ -104,6 +104,9 @@ pub enum Anchor {
         /// where the card hangs, normalized (may be <0 or >1)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<[f32; 2]>,
+        /// user-set card size in px [w, h]; zero/absent = pad default
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<[f32; 2]>,
     },
     /// Marginal note hanging beside the page, at this vertical position.
     Margin { y: f32 },
@@ -167,6 +170,7 @@ pub fn next_note_color(name: &str) -> String {
 }
 
 /// A slightly darker variant of a note color, for borders / connectors.
+#[allow(dead_code)] // returns with the card-colors pass
 pub fn darker_parts(c: [u8; 3], factor: f32) -> [u8; 3] {
     [
         (c[0] as f32 * factor) as u8,

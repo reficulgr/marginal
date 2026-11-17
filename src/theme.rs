@@ -113,6 +113,8 @@ pub fn register_fonts(ctx: &egui::Context) {
 /// Line height for handwritten note text: one step tighter than the font's
 /// natural row height. Dial in `theme.rs`: smaller = tighter.
 pub const NOTE_LEADING: f32 = 18.0;
+/// Inner padding between a paper edge and its ink.
+pub const NOTE_PAD: f32 = 15.0;
 
 /// Lay out note text in the handwritten font with the tightened leading.
 pub fn layout_note(
