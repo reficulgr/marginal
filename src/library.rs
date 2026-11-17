@@ -63,7 +63,9 @@ impl Library {
 
     pub fn show(&mut self, ui: &mut Ui, status: &crate::app::ScanStatus) {
         // toolbar
-        egui::Panel::top("lib_toolbar").show(ui, |ui| {
+        egui::Panel::top("lib_toolbar")
+            .frame(crate::theme::panel_frame())
+            .show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("📚 Glossa");
@@ -103,7 +105,9 @@ impl Library {
         }
 
         // status strip
-        egui::Panel::bottom("lib_status").show(ui, |ui| {
+        egui::Panel::bottom("lib_status")
+            .frame(crate::theme::panel_frame())
+            .show(ui, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 match status {
@@ -137,6 +141,8 @@ impl Library {
 
         // grid
         egui::CentralPanel::default().show(ui, |ui| {
+            crate::theme::paint_canvas(ui);
+
             let books = self.sync_thumbs(ui.ctx());
             if books.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -169,15 +175,15 @@ impl Library {
 
         // background
         let bg = if resp.hovered() {
-            Color32::from_rgb(52, 54, 60)
+            Color32::from_rgb(62, 66, 74)
         } else {
-            Color32::from_rgb(42, 44, 50)
+            Color32::from_rgb(52, 56, 63)
         };
         ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(8),
-            egui::Stroke::new(1.0, Color32::from_rgb(60, 62, 70)),
+            egui::Stroke::new(1.0, Color32::from_rgb(80, 84, 92)),
             egui::StrokeKind::Middle,
         );
 
@@ -212,13 +218,13 @@ impl Library {
             );
         } else {
             ui.painter()
-                .rect_filled(thumb_rect, CornerRadius::same(2), Color32::from_rgb(58, 60, 68));
+                .rect_filled(thumb_rect, CornerRadius::same(2), Color32::from_rgb(64, 68, 76));
             ui.painter().text(
                 thumb_rect.center(),
                 Align2::CENTER_CENTER,
                 book.format.label(),
                 FontId::proportional(20.0),
-                Color32::from_rgb(120, 124, 135),
+                Color32::from_rgb(130, 134, 145),
             );
         }
 

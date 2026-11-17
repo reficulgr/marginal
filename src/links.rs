@@ -157,22 +157,110 @@ pub fn describe(target: &LinkTarget) -> String {
     }
 }
 
-/// Draw a little curved connector between two points (used by reader).
-pub fn draw_connector(
+/// A hand-drawn-looking dashed trail: the path wobbles deterministically
+/// (stable for a given seed, so notes don't shimmer), and the ink is laid in
+/// short dashes of slightly varying length and spacing — pencil, not ruler.
+pub fn hand_dashed_line(
     painter: &egui::Painter,
     from: Pos2,
     to: Pos2,
+    seed: u64,
     color: Color32,
 ) {
-    let mut pts = Vec::with_capacity(25);
-    let dy = (to.y - from.y) * 0.3;
-    for i in 0..=24 {
-        let t = i as f32 / 24.0;
+    // 1) base path: cubic bezier
+    let mid_y = (from.y + to.y) * 0.5;
+    let p1 = Pos2::new(from.x, mid_y);
+    let p2 = Pos2::new(to.x, mid_y);
+
+    let n = 48;
+    let mut pts: Vec<Pos2> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
         let mt = 1.0 - t;
-        let x = mt * from.x + t * to.x;
-        let y = mt * mt * from.y + 2.0 * mt * t * ((from.y + to.y) * 0.5 + dy) + t * t * to.y;
+        let mut x = mt * mt * mt * from.x
+            + 3.0 * mt * mt * t * p1.x
+            + 3.0 * mt * t * t * p2.x
+            + t * t * t * to.x;
+        let mut y = mt * mt * mt * from.y
+            + 3.0 * mt * mt * t * p1.y
+            + 3.0 * mt * t * t * p2.y
+            + t * t * t * to.y;
+        if i == 0 {
+            x = from.x;
+            y = from.y;
+        }
+        if i == n {
+            x = to.x;
+            y = to.y;
+        }
         pts.push(Pos2::new(x, y));
     }
-    painter.line(pts, egui::Stroke::new(1.8, color));
-    painter.circle_filled(to, 3.0, color);
+
+    // 2) deterministic smooth wobble perpendicular to the path.
+    let p = seed as f32 * 0.618_033_99;
+    let mut wobbled = pts.clone();
+    for i in 1..n {
+        let t = i as f32 / n as f32;
+        let prev = pts[i - 1];
+        let cur = pts[i];
+        let next = pts[i + 1];
+        let tangent = Pos2::new(next.x - prev.x, next.y - prev.y);
+        let len = tangent.x.hypot(tangent.y).max(0.001);
+        let nx = -tangent.y / len;
+        let ny = tangent.x / len;
+        // fade the wobble near the endpoints
+        let fade = (3.0 * t * (1.0 - t)).min(1.0);
+        let amp = 2.6 * fade;
+        let wobble = amp * (0.65 * (t * 7.0 + p).sin() + 0.35 * (t * 13.0 + p * 1.7).sin());
+        wobbled[i] = Pos2::new(cur.x + nx * wobble, cur.y + ny * wobble);
+    }
+    let pts = wobbled;
+
+    // 3) cumulative arclength, then lay dashes and gaps along it, each piece
+    //    a touch different in length — like real handwriting pressure
+    let mut cumulative = Vec::with_capacity(pts.len());
+    cumulative.push(0.0);
+    for i in 1..pts.len() {
+        cumulative.push(cumulative[i - 1] + (pts[i] - pts[i - 1]).length());
+    }
+    let total = *cumulative.last().unwrap_or(&0.0);
+    if total <= 2.0 {
+        return;
+    }
+
+    // position at arclength `s`; `cursor` resumes the search each call
+    let pos_at = |s: f32, cursor: &mut usize| -> Pos2 {
+        while *cursor + 1 < cumulative.len() && cumulative[*cursor + 1] < s {
+            *cursor += 1;
+        }
+        let a = cumulative[*cursor];
+        let b = cumulative.get(*cursor + 1).copied().unwrap_or(a);
+        let span = (b - a).max(0.0001);
+        let f = ((s - a) / span).clamp(0.0, 1.0);
+        let p0 = pts[*cursor];
+        let p1_ = pts.get(*cursor + 1).copied().unwrap_or(p0);
+        Pos2::new(p0.x + (p1_.x - p0.x) * f, p0.y + (p1_.y - p0.y) * f)
+    };
+
+    let stroke = egui::Stroke::new(1.4, color);
+    let mut cursor = 0usize;
+    let mut s = 0.0;
+    let mut is_ink = true;
+    while s < total {
+        let len = if is_ink {
+            // dashes: ~4–7px, breathing like pressure
+            4.5 + 1.8 * (0.5 + 0.5 * (s * 0.21 + p).sin())
+        } else {
+            // gaps: ~6–9px
+            6.5 + 2.5 * (0.5 + 0.5 * (s * 0.17 + p * 1.3).sin())
+        };
+        let end_s = (s + len).min(total);
+        if is_ink && end_s > s {
+            let a = pos_at(s, &mut cursor);
+            let b = pos_at(end_s, &mut cursor);
+            painter.line_segment([a, b], stroke);
+        }
+        s = end_s;
+        is_ink = !is_ink;
+    }
 }

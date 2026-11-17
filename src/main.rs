@@ -9,6 +9,7 @@ mod reader;
 mod scan;
 mod sidecar;
 mod store;
+mod theme;
 
 use anyhow::Result;
 

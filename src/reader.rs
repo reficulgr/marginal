@@ -44,6 +44,8 @@ pub struct Reader {
 
     page_tex_cache: std::collections::HashMap<u32, PageTex>,
     annotations: Vec<Annotation>,
+    /// pan offset of the whole desk (space+drag, wheel) in screen px
+    pan: Vec2,
 
     /// armed "click on page to add" mode
     armed: Option<ArmMode>,
@@ -64,7 +66,7 @@ impl Reader {
         let annotations = crate::store::with_store(&store, |s| s.annotations_for_book(book.id))
             .unwrap_or_default();
         crate::store::with_store(&store, |s| s.touch_opened(book.id)).ok();
-        Reader {
+        let mut reader = Reader {
             store,
             book,
             doc,
@@ -73,6 +75,7 @@ impl Reader {
             zoom: 1.0,
             page_tex_cache: Default::default(),
             annotations,
+            pan: Vec2::ZERO,
             armed: None,
             editing: None,
             link_dialog: None,
@@ -81,11 +84,67 @@ impl Reader {
             toast_out: None,
             toast_at: 0.0,
             pending_jump: None,
-        }
+        };
+        reader.migrate_postit_cards();
+        reader
     }
 
     pub fn go_to_page(&mut self, page: u32) {
         self.page = page.clamp(1, self.page_count.max(1));
+    }
+
+    /// Give legacy post-its (anchor-only) a hung card position, and stack
+    /// cards on the same side so they don't overlap.
+    fn migrate_postit_cards(&mut self) {
+        let indexes: Vec<usize> = self
+            .annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                matches!(&a.anchor, Anchor::PostIt { card: None, .. })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in indexes {
+            self.annotations[i].anchor = self.hang_off_card_pos(i);
+            self.save_annotation(self.annotations[i].clone());
+        }
+    }
+
+    /// Card position hanging outside the page for post-it [i] (by index):
+    /// side picked by pin x, vertically centered near the pin row, nudged
+    /// downward past other cards on the same side.
+    fn hang_off_card_pos(&self, index: usize) -> Anchor {
+        let ann = &self.annotations[index];
+        let Anchor::PostIt { x, y, .. } = ann.anchor else {
+            return ann.anchor.clone();
+        };
+        let left = x <= 0.5;
+        let cx = if left { -0.18 } else { 1.02 };
+        let mut cy = (y - 0.05).max(-0.25);
+        for _ in 0..12 {
+            let overlapping = self.annotations.iter().any(|other| {
+                if let Anchor::PostIt {
+                    card: Some([_, oy]),
+                    x: ox,
+                    ..
+                } = other.anchor
+                {
+                    (ox <= 0.5) == left && (oy - cy).abs() < 0.14
+                } else {
+                    false
+                }
+            });
+            if !overlapping {
+                break;
+            }
+            cy += 0.16;
+        }
+        Anchor::PostIt {
+            x,
+            y,
+            card: Some([cx, cy]),
+        }
     }
 
     fn fetch_annotation(&self, id: &str) -> Option<Annotation> {
@@ -130,7 +189,9 @@ impl Reader {
         }
 
         // toolbar
-        egui::Panel::top("reader_toolbar").show(ui, |ui| {
+        egui::Panel::top("reader_toolbar")
+            .frame(crate::theme::panel_frame())
+            .show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("← Library").clicked() {
@@ -207,6 +268,7 @@ impl Reader {
             egui::Panel::right("reader_links")
                 .resizable(true)
                 .default_size(320.0)
+                .frame(crate::theme::panel_frame())
                 .show(ui, |ui| {
                     self.links_panel(ui);
                 });
@@ -223,12 +285,45 @@ impl Reader {
     // ==================================================================
 
     fn canvas(&mut self, ui: &mut Ui) {
-        // zoom: ctrl+wheel
+        // charcoal + dot grid backdrop, behind everything
+        crate::theme::paint_canvas(ui);
+
+        // zoom (ctrl+wheel)
         let zd = ui.input(|i| i.zoom_delta());
         if zd != 1.0 {
             self.zoom = (self.zoom * zd).clamp(0.35, 4.0);
         }
-        // keyboard nav
+
+        // panning: space+drag anywhere, wheel pans too
+        let editing_active = self.editing.is_some();
+        let (space_down, drag_delta, primary_down) = ui.input(|i| {
+            (
+                i.key_down(Key::Space),
+                i.pointer.delta(),
+                i.pointer.primary_down(),
+            )
+        });
+        if !editing_active {
+            if space_down && primary_down && drag_delta != Vec2::ZERO {
+                self.pan += drag_delta;
+            }
+            if zd == 1.0 {
+                let wheel = ui.input(|i| i.smooth_scroll_delta());
+                if wheel != Vec2::ZERO {
+                    self.pan += wheel;
+                }
+            }
+        }
+        // hand cursor while space is active (not while typing)
+        if !editing_active && space_down {
+            ui.ctx().set_cursor_icon(if primary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+
+        // keyboard page nav
         let (pgup, pgdn, home, end) = ui.input(|i| {
             (
                 i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft),
@@ -284,92 +379,81 @@ impl Reader {
         let has_margin_notes = page_annotations
             .iter()
             .any(|a| matches!(a.anchor, Anchor::Margin { .. }));
-        let strip = if has_margin_notes { MARGIN_STRIP_W } else { 0.0 };
 
-        let mut page_rect_opt: Option<Rect> = None;
+        // the page floats at the top-center of the desk, shifted by pan
+        let avail = ui.max_rect();
+        let page_rect = Rect::from_min_size(
+            pos2(
+                avail.center().x - page_size.x * 0.5 + self.pan.x,
+                avail.top() + 28.0 + self.pan.y,
+            ),
+            page_size,
+        );
 
-        ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(12.0);
-                let left_space = ((ui.available_width() - page_size.x - strip) / 2.0).max(24.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(left_space);
+        // ----- page -----
+        let page_id = egui::Id::unique(("reader-page", self.book.id));
+        ui.advance_cursor_after_rect(page_rect);
+        let resp = ui.interact(page_rect, page_id, Sense::click());
 
-                    // ----- page -----
-                    let (page_rect, resp) = ui.allocate_exact_size(page_size, Sense::click());
-                    page_rect_opt = Some(page_rect);
+        ui.painter().rect_filled(
+            page_rect.translate(vec2(6.0, 8.0)),
+            CornerRadius::same(2),
+            Color32::from_black_alpha(90),
+        );
+        ui.painter().rect_filled(page_rect, CornerRadius::same(2), Color32::WHITE);
+        ui.painter().image(
+            tex.id(),
+            page_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
 
-                    ui.painter().rect_filled(
-                        page_rect.translate(vec2(6.0, 8.0)),
-                        CornerRadius::same(2),
-                        Color32::from_black_alpha(26),
-                    );
-                    ui.painter().rect_filled(page_rect, CornerRadius::same(2), Color32::WHITE);
-                    ui.painter().image(
-                        tex.id(),
-                        page_rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+        // armed creation hint + click (clicks are suppressed while space-panning)
+        if self.armed.is_some() {
+            if let Some(p) = resp.hover_pos() {
+                let hint = match self.armed {
+                    Some(ArmMode::PostIt) => "📌 pin here",
+                    Some(ArmMode::Margin) => "🗒 place here",
+                    None => "",
+                };
+                ui.painter().text(
+                    p + vec2(0.0, -14.0),
+                    Align2::CENTER_CENTER,
+                    hint,
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(70, 70, 70),
+                );
+            }
+        }
+        let space_down_now = space_down;
+        if resp.clicked() && !space_down_now {
+            if let Some(p) = resp.hover_pos() {
+                self.on_page_clicked(p, page_rect);
+            }
+        }
 
-                    // armed creation hint + click
-                    if self.armed.is_some() {
-                        if let Some(p) = resp.hover_pos() {
-                            let hint = match self.armed {
-                                Some(ArmMode::PostIt) => "📌 pin here",
-                                Some(ArmMode::Margin) => "🗒 place here",
-                                None => "",
-                            };
-                            ui.painter().text(
-                                p + vec2(0.0, -14.0),
-                                Align2::CENTER_CENTER,
-                                hint,
-                                FontId::proportional(13.0),
-                                Color32::from_rgb(70, 70, 70),
-                            );
-                        }
-                    }
-                    if resp.clicked() {
-                        if let Some(p) = resp.hover_pos() {
-                            self.on_page_clicked(p, page_rect);
-                        }
-                    }
+        // ----- post-its: pins + hanging cards -----
+        for ann in &page_annotations {
+            if let Anchor::PostIt { .. } = ann.anchor {
+                self.draw_postit(ui, ann, page_rect);
+            }
+        }
 
-                    // ----- post-its on the page -----
-                    for ann in &page_annotations {
-                        if let Anchor::PostIt { x, y } = ann.anchor {
-                            let card_min =
-                                page_rect.min + vec2(x * page_rect.width(), y * page_rect.height());
-                            self.draw_postit(
-                                ui,
-                                ann,
-                                card_min,
-                                page_rect,
-                            );
-                        }
-                    }
-                });
-
-                // ----- margin strip (vertically aligned with page) -----
-                if has_margin_notes {
-                    ui.allocate_ui(egui::vec2(strip, page_size.y + 12.0), |ui| {
-                        let strip_rect = ui.available_rect_before_wrap();
-                        if let Some(pr) = page_rect_opt {
-                            for ann in &page_annotations {
-                                if let Anchor::Margin { .. } = ann.anchor {
-                                    self.draw_margin_note(ui, ann, strip_rect, pr);
-                                }
-                            }
-                        }
-                    });
+        // ----- marginalia: chalk hanging beside the page -----
+        if has_margin_notes {
+            let strip_rect = Rect::from_min_size(
+                pos2(page_rect.right(), page_rect.top()),
+                vec2(MARGIN_STRIP_W, page_size.y),
+            );
+            for ann in &page_annotations {
+                if let Anchor::Margin { .. } = ann.anchor {
+                    self.draw_margin_note(ui, ann, strip_rect, page_rect);
                 }
-            });
+            }
+        }
 
         // connectors + markers drawn last (topmost)
-        if let Some(pr) = page_rect_opt {
-            self.draw_link_overlays(ui, &page_annotations, pr);
-        }
+        self.draw_link_overlays(ui, &page_annotations, page_rect);
 
         // link picker dialog
         if let Some(mut dialog) = self.link_dialog.take() {
@@ -432,7 +516,7 @@ impl Reader {
         let ny = ((p.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0);
         let now = now_secs();
         let (anchor, default_color) = match mode {
-            ArmMode::PostIt => (Anchor::PostIt { x: nx, y: ny }, "yellow"),
+            ArmMode::PostIt => (Anchor::PostIt { x: nx, y: ny, card: None }, "yellow"),
             ArmMode::Margin => (Anchor::Margin { y: ny }, "blue"),
         };
         let ann = Annotation {
@@ -446,6 +530,12 @@ impl Reader {
         };
         crate::store::with_store(&self.store, |s| s.insert_annotation(self.book.id, &ann)).ok();
         self.annotations.push(ann.clone());
+        // post-its: hang the card off the pin, stacked to avoid clutter
+        if matches!(ann.anchor, Anchor::PostIt { .. }) {
+            let i = self.annotations.len() - 1;
+            self.annotations[i].anchor = self.hang_off_card_pos(i);
+            self.save_annotation(self.annotations[i].clone());
+        }
         self.armed = None;
         self.editing = Some(EditingNote {
             id: ann.id,
@@ -457,45 +547,89 @@ impl Reader {
     // Post-its
     // ==================================================================
 
-    fn draw_postit(&mut self, ui: &mut Ui, ann: &Annotation, card_min_pos: Pos2, page_rect: Rect) {
-        let color = note_color_ui(&ann.color);
-        let border = border_color_ui(&ann.color);
+    /// A post-it = a red pin on the page + a yellow card hanging on the desk,
+    /// joined by a faint dashed thread. The pin moves on the page; the card
+    /// floats anywhere (the pan makes even far-off cards reachable).
+    fn draw_postit(&mut self, ui: &mut Ui, ann: &Annotation, page_rect: Rect) {
+        let Anchor::PostIt {
+            x,
+            y,
+            card: Some([cx, cy]),
+        } = ann.anchor
+        else {
+            return;
+        };
+        let card_fill = note_color_ui(&ann.color);
+        let thread_color = crate::theme::postit_thread();
 
-        // keep the card on the page
-        let clamped_min = pos2(
-            card_min_pos
-                .x
-                .clamp(page_rect.left(), (page_rect.right() - 30.0).max(page_rect.left())),
-            card_min_pos
-                .y
-                .clamp(page_rect.top(), (page_rect.bottom() - 30.0).max(page_rect.top())),
+        let pin_pos = pos2(
+            page_rect.min.x + x * page_rect.width(),
+            page_rect.min.y + y * page_rect.height(),
         );
-        let rect = Rect::from_min_size(clamped_min, POSTIT_SIZE);
+        let card = Rect::from_min_size(
+            pos2(
+                page_rect.min.x + cx * page_rect.width(),
+                page_rect.min.y + cy * page_rect.height(),
+            ),
+            POSTIT_SIZE,
+        );
+
+        // ----- red pin, draggable anywhere on the page -----
+        let pin_id = egui::Id::unique(("postit-pin", ann.id.clone()));
+        let pin_rect = Rect::from_center_size(pin_pos, vec2(14.0, 14.0));
+        ui.advance_cursor_after_rect(pin_rect);
+        let pin_resp = ui.interact(pin_rect, pin_id, Sense::click_and_drag());
+
+        // ----- pencil thread, quite transparent -----
+        if !card.contains(pin_pos) {
+            let attach = edge_point_toward(card, pin_pos);
+            let seed = egui::util::hash((ann.id.clone(), "thread"));
+            links::hand_dashed_line(&ui.painter().clone(), pin_pos, attach, seed, thread_color);
+        }
+        let pin_radius = if pin_resp.hovered() || pin_resp.dragged() { 6.5 } else { 4.5 };
+        ui.painter().circle_filled(pin_pos, pin_radius, crate::theme::PIN_RED);
+        if pin_resp.hovered() || pin_resp.dragged() {
+            ui.painter().text(
+                pin_pos + vec2(8.0, -12.0),
+                Align2::LEFT_BOTTOM,
+                "drag pin",
+                FontId::proportional(10.0),
+                Color32::from_rgb(150, 150, 150),
+            );
+        }
 
         if self.editing.as_ref().map(|e| e.id == ann.id).unwrap_or(false) {
             let mut editing = self.editing.take().unwrap();
             let edit_id = egui::Id::unique(("edit-note", editing.id.clone()));
+            ui.painter().rect_filled(card, CornerRadius::same(3), card_fill);
             ui.painter().rect_stroke(
-                rect,
+                card,
                 CornerRadius::same(3),
-                Stroke::new(2.0, border),
+                Stroke::new(2.0, crate::theme::PIN_RED),
                 egui::StrokeKind::Middle,
             );
             let mut buf = editing.buf.clone();
+            let dark_ink = Color32::from_rgb(45, 45, 45);
+            let mut layouter =
+                |ui: &Ui, text: &dyn egui::TextBuffer, width: f32| -> std::sync::Arc<egui::Galley> {
+                    crate::theme::layout_note(ui, text.as_str(), width, dark_ink)
+                };
             let te = egui::TextEdit::multiline(&mut buf)
-                .desired_width(rect.width() - 14.0)
-                .id_salt(edit_id);
-            let resp = ui.put(
-                rect.shrink2(vec2(7.0, 5.0)).expand2(vec2(0.0, 10.0)),
-                te,
-            );
+                .desired_width(card.width() - 14.0)
+                .frame(egui::Frame::NONE)
+                .layouter(&mut layouter)
+                .id(edit_id);
+            let resp = ui.put(card.shrink2(vec2(7.0, 5.0)), te);
             editing.buf = buf;
             ui.memory_mut(|m| m.request_focus(edit_id));
-            let escaped = ui.input(|i| i.key_pressed(Key::Escape));
-            let lost = resp.lost_focus()
-                && ui.input(|i| i.pointer.primary_released())
-                && !ui.rect_contains_pointer(rect);
-            if escaped || lost {
+            ui.painter().text(
+                pos2(card.left(), card.bottom() + 12.0),
+                Align2::LEFT_TOP,
+                "Esc or click away to save",
+                FontId::proportional(10.0),
+                Color32::from_rgb(140, 140, 145),
+            );
+            if editor_should_commit(ui, &resp, card) {
                 let mut saved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
                 saved.body = editing.buf.clone();
                 saved.updated_at = now_secs();
@@ -506,21 +640,24 @@ impl Reader {
             return;
         }
 
-        let (_, resp) = ui.allocate_exact_size(POSTIT_SIZE, Sense::click_and_drag());
-        let r = rect;
+        // ----- the card itself -----
+        let card_id = egui::Id::unique(("postit", ann.id.clone()));
+        ui.advance_cursor_after_rect(card);
+        let resp = ui.interact(card, card_id, Sense::click_and_drag());
+        let r = card;
 
         ui.painter()
             .rect_filled(r.translate(vec2(2.0, 3.0)), CornerRadius::same(3), Color32::from_black_alpha(38));
-        ui.painter().rect_filled(r, CornerRadius::same(3), color);
+        ui.painter().rect_filled(r, CornerRadius::same(3), card_fill);
         ui.painter()
-            .rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, border), egui::StrokeKind::Middle);
+            .rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, border_color_ui(&ann.color)), egui::StrokeKind::Middle);
 
         if !ann.body.trim().is_empty() {
-            let g = ui.painter().layout(
-                ann.body.clone(),
-                FontId::proportional(12.0),
-                Color32::from_rgb(40, 40, 40),
+            let g = crate::theme::layout_note(
+                ui,
+                ann.body.as_str(),
                 r.width() - 12.0,
+                Color32::from_rgb(40, 40, 40),
             );
             ui.painter().galley(r.min + vec2(6.0, 6.0), g, Color32::from_rgb(40, 40, 40));
         } else {
@@ -533,17 +670,30 @@ impl Reader {
             );
         }
 
-        if resp.hovered() {
-            self.note_hover_bar(ui, ann, r);
-        }
+        // hover bar (stays up while the pointer is over the bar itself)
+        self.note_hover_bar(ui, ann, r, resp.hovered());
 
-        // drag to move
+        // drag the card anywhere on the desk
         if resp.dragged() {
             let delta = resp.drag_delta();
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
-            if let Anchor::PostIt { x, y } = &mut moved.anchor {
-                *x += delta.x / page_rect.width();
-                *y += delta.y / page_rect.height();
+            if let Anchor::PostIt {
+                card: Some([cx, cy]),
+                ..
+            } = &mut moved.anchor
+            {
+                *cx += delta.x / page_rect.width();
+                *cy += delta.y / page_rect.height();
+            }
+            self.save_annotation(moved);
+        }
+        // drag the pin to re-target (stays on the page)
+        if pin_resp.dragged() {
+            let delta = pin_resp.drag_delta();
+            let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
+            if let Anchor::PostIt { x, y, .. } = &mut moved.anchor {
+                *x = (*x + delta.x / page_rect.width()).clamp(0.0, 1.0);
+                *y = (*y + delta.y / page_rect.height()).clamp(0.0, 1.0);
             }
             self.save_annotation(moved);
         }
@@ -560,57 +710,81 @@ impl Reader {
     // ==================================================================
 
     fn draw_margin_note(&mut self, ui: &mut Ui, ann: &Annotation, strip: Rect, page_rect: Rect) {
-        let color = note_color_ui(&ann.color);
-        let border = border_color_ui(&ann.color);
+        // marginalia = white chalk handwriting floating on the desk.
+        // No card. The note's color only shows in the connector + anchor dot.
+        let ink = crate::theme::NOTE_CHALK;
+        let thread = note_color_ui(&ann.color);
         let Anchor::Margin { y } = ann.anchor else { return };
 
         let w = strip.width();
         let y_screen = strip.top() + y * page_rect.height();
 
-        // estimate card height from wrap
+        // measure the text so the interaction area fits the handwriting
         let probe_text = if ann.body.is_empty() {
             "…".to_string()
         } else {
             ann.body.clone()
         };
-        let probe = ui.painter().layout(
-            probe_text,
-            FontId::proportional(12.0),
-            Color32::from_rgb(40, 40, 40),
-            w - 24.0,
-        );
-        let h = (probe.size().y + 16.0).max(42.0);
-        let rect = Rect::from_min_size(pos2(strip.left() + 12.0, y_screen), vec2(w - 24.0, h));
+        let probe = crate::theme::layout_note(ui, probe_text.as_str(), w - 12.0, ink);
+        let h = (probe.size().y + 8.0).max(42.0);
+        let rect = Rect::from_min_size(pos2(strip.left() + 4.0, y_screen), vec2(w - 12.0, h));
 
-        // connector from page-edge anchor to the card
+        // the anchor dot on the page edge is itself draggable: grabbing it
+        // re-targets which passage this marginalia points at
         let anchor_pt = pos2(page_rect.left(), y_screen);
-        let to = pos2(rect.right(), rect.top() + 14.0);
-        let stroke = Stroke::new(2.0, border.gamma_multiply(0.85));
-        ui.painter().line(bezier(anchor_pt, to), stroke);
-        ui.painter().circle_filled(anchor_pt, 4.0, border);
+        let dot_id = egui::Id::unique(("margin-anchor", ann.id.clone()));
+        let dot_rect = Rect::from_center_size(anchor_pt, vec2(14.0, 14.0));
+        ui.advance_cursor_after_rect(dot_rect);
+        let dot_resp = ui.interact(dot_rect, dot_id, Sense::click_and_drag());
+
+        // connector thread from page-edge anchor to the text — a pencil
+        // dotted trail, wobbling deterministically per note
+        let to = pos2(rect.left() - 6.0, rect.top() + 12.0);
+        let seed = egui::util::hash(ann.id.clone());
+        links::hand_dashed_line(&ui.painter().clone(), anchor_pt, to, seed, crate::theme::CONNECTOR);
+        let dot_radius = if dot_resp.hovered() || dot_resp.dragged() { 6.0 } else { 4.0 };
+        ui.painter().circle_filled(anchor_pt, dot_radius, thread);
+        if dot_resp.hovered() || dot_resp.dragged() {
+            ui.painter().text(
+                pos2(anchor_pt.x - 8.0, anchor_pt.y - 14.0),
+                Align2::RIGHT_CENTER,
+                "drag to re-target",
+                FontId::proportional(10.0),
+                Color32::from_rgb(140, 140, 145),
+            );
+        }
 
         if self.editing.as_ref().map(|e| e.id == ann.id).unwrap_or(false) {
             let mut editing = self.editing.take().unwrap();
             let edit_id = egui::Id::unique(("edit-note", editing.id.clone()));
+            // only a ghost outline marks the editing area — the words float
             ui.painter().rect_stroke(
                 rect,
                 CornerRadius::same(3),
-                Stroke::new(2.0, border),
+                Stroke::new(1.0, Color32::from_white_alpha(45)),
                 egui::StrokeKind::Middle,
             );
             let mut buf = editing.buf.clone();
+            let mut layouter =
+                |ui: &Ui, text: &dyn egui::TextBuffer, width: f32| -> std::sync::Arc<egui::Galley> {
+                    crate::theme::layout_note(ui, text.as_str(), width, ink)
+                };
             let te = egui::TextEdit::multiline(&mut buf)
-                .desired_width(rect.width() - 14.0)
-                .id_salt(edit_id);
-            let resp = ui.put(
-                rect.expand2(vec2(0.0, 80.0)).shrink2(vec2(12.0, 6.0)),
-                te,
-            );
+                .desired_width(rect.width())
+                .frame(egui::Frame::NONE)
+                .layouter(&mut layouter)
+                .id(edit_id);
+            let resp = ui.put(rect, te);
             editing.buf = buf;
             ui.memory_mut(|m| m.request_focus(edit_id));
-            let escaped = ui.input(|i| i.key_pressed(Key::Escape));
-            let lost = resp.lost_focus() && !ui.rect_contains_pointer(rect);
-            if escaped || lost {
+            ui.painter().text(
+                pos2(rect.left(), rect.bottom() + 12.0),
+                Align2::LEFT_TOP,
+                "Esc or click away to save",
+                FontId::proportional(10.0),
+                Color32::from_rgb(140, 140, 145),
+            );
+            if editor_should_commit(ui, &resp, rect) {
                 let mut saved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
                 saved.body = editing.buf.clone();
                 saved.updated_at = now_secs();
@@ -621,42 +795,40 @@ impl Reader {
             return;
         }
 
-        let (_, resp) = ui.allocate_exact_size(rect.size(), Sense::click_and_drag());
+        // interaction at the text's exact position, with a stable id
+        let card_id = egui::Id::unique(("margin", ann.id.clone()));
+        ui.advance_cursor_after_rect(rect);
+        let resp = ui.interact(rect, card_id, Sense::click_and_drag());
         let r = rect;
-
-        ui.painter()
-            .rect_filled(r.translate(vec2(2.0, 2.0)), CornerRadius::same(3), Color32::from_black_alpha(30));
-        ui.painter().rect_filled(r, CornerRadius::same(3), color);
-        ui.painter()
-            .rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, border), egui::StrokeKind::Middle);
 
         if ann.body.trim().is_empty() {
             ui.painter().text(
-                r.center(),
-                Align2::CENTER_CENTER,
+                r.left_bottom() + vec2(2.0, -2.0),
+                Align2::LEFT_BOTTOM,
                 "double-click to write",
                 FontId::proportional(11.0),
-                Color32::from_rgb(120, 120, 120),
+                Color32::from_rgb(90, 95, 104),
             );
         } else {
-            let g = ui.painter().layout(
-                ann.body.clone(),
-                FontId::proportional(12.0),
-                Color32::from_rgb(40, 40, 40),
-                r.width() - 12.0,
-            );
-            ui.painter().galley(r.min + vec2(6.0, 7.0), g, Color32::from_rgb(40, 40, 40));
+            let g = crate::theme::layout_note(ui, ann.body.as_str(), r.width(), ink);
+            ui.painter().galley(r.min, g, ink);
         }
 
-        if resp.hovered() {
-            self.note_hover_bar(ui, ann, r);
-        }
+        // hover bar (stays up while the pointer is over the bar itself)
+        self.note_hover_bar(ui, ann, r, resp.hovered());
 
-        // vertical drag re-anchors the note height
+        // vertical drag re-anchors the note height (card OR its anchor dot)
         if resp.dragged() {
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
             if let Anchor::Margin { y } = &mut moved.anchor {
                 *y += resp.drag_delta().y / page_rect.height();
+            }
+            self.save_annotation(moved);
+        }
+        if dot_resp.dragged() {
+            let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
+            if let Anchor::Margin { y } = &mut moved.anchor {
+                *y += dot_resp.drag_delta().y / page_rect.height();
             }
             self.save_annotation(moved);
         }
@@ -672,9 +844,15 @@ impl Reader {
     // Shared note UI bits
     // ==================================================================
 
-    fn note_hover_bar(&mut self, ui: &mut Ui, ann: &Annotation, rect: Rect) {
+    fn note_hover_bar(&mut self, ui: &mut Ui, ann: &Annotation, rect: Rect, card_hovered: bool) {
         let bar_y = (rect.min.y - BAR_H - 4.0).max(4.0);
         let bar = Rect::from_min_size(pos2(rect.min.x, bar_y), vec2(rect.width(), BAR_H));
+
+        // keep the bar visible while the pointer is anywhere on card or bar
+        let bar_hovered = ui.rect_contains_pointer(bar) || ui.rect_contains_pointer(rect);
+        if !(card_hovered || bar_hovered) {
+            return;
+        }
         let bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar).invisible());
         let mut bar_ui = bar_ui;
         bar_ui.horizontal(|ui| {
@@ -690,12 +868,6 @@ impl Reader {
                     self.book.fingerprint.clone(),
                     self.page,
                 ));
-            }
-            if ui.small_button("🎨").on_hover_text("cycle color").clicked() {
-                let mut saved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
-                saved.color = next_note_color(&saved.color);
-                saved.updated_at = now_secs();
-                self.save_annotation(saved);
             }
             if ui.small_button("🗑").on_hover_text("delete").clicked() {
                 crate::store::with_store(&self.store, |s| s.delete_annotation(&ann.id)).ok();
@@ -732,10 +904,12 @@ impl Reader {
             match target {
                 LinkTarget::Annotation(dst) => {
                     let Some(dst_ann) = page_annotations.iter().find(|a| &a.id == dst) else { continue };
-                    links::draw_connector(
-                        &ui.painter(),
+                    let seed = egui::util::hash((src.clone(), dst.clone()));
+                    links::hand_dashed_line(
+                        &ui.painter().clone(),
                         card_focus(src_ann, page_rect),
                         card_focus(dst_ann, page_rect),
+                        seed,
                         Color32::from_rgb(125, 95, 170),
                     );
                 }
@@ -924,6 +1098,19 @@ impl Reader {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// Inline note editors commit on: Esc, focus loss, or a click outside the card.
+fn editor_should_commit(ui: &Ui, resp: &egui::Response, rect: Rect) -> bool {
+    let escaped = ui.input(|i| i.key_pressed(Key::Escape));
+    if escaped {
+        return true;
+    }
+    if resp.lost_focus() {
+        return true;
+    }
+    let (released, pos) = ui.input(|i| (i.pointer.primary_released(), i.pointer.latest_pos()));
+    released && matches!(pos, Some(p) if !rect.expand(12.0).contains(p))
+}
+
 pub fn note_color_ui(name: &str) -> Color32 {
     let [r, g, b] = note_color_parts(name);
     Color32::from_rgb(r, g, b)
@@ -945,7 +1132,7 @@ fn note_preview(body: &str, max: usize) -> String {
 
 fn card_focus(ann: &Annotation, page_rect: Rect) -> Pos2 {
     match ann.anchor {
-        Anchor::PostIt { x, y } => pos2(
+        Anchor::PostIt { x, y, .. } => pos2(
             page_rect.min.x + x * page_rect.width(),
             page_rect.min.y + y * page_rect.height(),
         ),
@@ -956,17 +1143,24 @@ fn card_focus(ann: &Annotation, page_rect: Rect) -> Pos2 {
     }
 }
 
-fn bezier(from: Pos2, to: Pos2) -> Vec<Pos2> {
-    let mid_y = (from.y + to.y) * 0.5;
-    let p1 = pos2(from.x, mid_y);
-    let p2 = pos2(to.x, mid_y);
-    let mut pts = Vec::with_capacity(25);
-    for i in 0..=24 {
-        let t = i as f32 / 24.0;
-        let mt = 1.0 - t;
-        let x = mt * mt * mt * from.x + 3.0 * mt * mt * t * p1.x + 3.0 * mt * t * t * p2.x + t * t * t * to.x;
-        let y = mt * mt * mt * from.y + 3.0 * mt * mt * t * p1.y + 3.0 * mt * t * t * p2.y + t * t * t * to.y;
-        pts.push(pos2(x, y));
+/// Where a line from `from` to the center of `rect` first touches `rect`
+/// (the thread should end on the card's border, not inside it).
+fn edge_point_toward(rect: Rect, from: Pos2) -> Pos2 {
+    if rect.contains(from) {
+        return from;
     }
-    pts
+    let center = rect.center();
+    let seg = center - from;
+    let mut lo = 0.0f32;
+    let mut hi = 1.0f32;
+    for _ in 0..14 {
+        let mid = (lo + hi) * 0.5;
+        let q = from + seg * mid;
+        if rect.contains(q) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    from + seg * hi
 }

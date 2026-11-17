@@ -95,8 +95,16 @@ pub type AnnotationId = String; // uuid v4
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Anchor {
-    /// Sticky note pinned onto the page. (x, y) = top-left corner of the card.
-    PostIt { x: f32, y: f32 },
+    /// Sticky note: a red pin somewhere on the page plus the card hanging
+    /// on the desk beside it (may be fully outside the page rectangle).
+    PostIt {
+        /// pin position, normalized to the page (0..1)
+        x: f32,
+        y: f32,
+        /// where the card hangs, normalized (may be <0 or >1)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<[f32; 2]>,
+    },
     /// Marginal note hanging beside the page, at this vertical position.
     Margin { y: f32 },
 }
@@ -147,6 +155,8 @@ pub fn note_color_parts(name: &str) -> [u8; 3] {
         .unwrap_or(NOTE_COLORS[0].1)
 }
 
+// Returned to duty when the card-colors discussion resumes.
+#[allow(dead_code)]
 pub fn next_note_color(name: &str) -> String {
     let idx = NOTE_COLORS
         .iter()

@@ -48,7 +48,12 @@ impl GlossaApp {
             library.set_folder(f);
         }
 
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        cc.egui_ctx.set_visuals({
+            let mut v = egui::Visuals::dark();
+            crate::theme::apply_visuals(&mut v);
+            v
+        });
+        crate::theme::register_fonts(&cc.egui_ctx);
 
         Ok(GlossaApp {
             store,
