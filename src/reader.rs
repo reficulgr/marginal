@@ -45,8 +45,8 @@ pub struct Reader {
     annotations: Vec<Annotation>,
     /// pan offset of the whole desk (space+drag, wheel) in screen px
     pan: Vec2,
-    /// paper grain texture, generated once
-    grain: Option<egui::TextureHandle>,
+    /// paper-grain texture per note color (opaque, flecks baked in)
+    grain: std::collections::HashMap<String, egui::TextureHandle>,
 
     /// armed "click on page to add" mode
     armed: Option<ArmMode>,
@@ -77,7 +77,7 @@ impl Reader {
             page_tex_cache: Default::default(),
             annotations,
             pan: Vec2::ZERO,
-            grain: None,
+            grain: Default::default(),
             armed: None,
             editing: None,
             link_dialog: None,
@@ -529,28 +529,35 @@ impl Reader {
         Some(tex)
     }
 
-    /// Procedural paper-grain tile (no asset files): sparse warm flecks.
-    fn ensure_grain(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
-        if let Some(t) = &self.grain {
+    /// Procedural paper-grain tile, per note color: the card color with baked
+    /// luminance wobble and sparse darker flecks — fully OPAQUE, so the mesh
+    /// is solid paper and the vertex shading multiplies over it.
+    fn ensure_grain(&mut self, ctx: &egui::Context, color: [u8; 3]) -> egui::TextureHandle {
+        let key = format!("{},{},{}", color[0], color[1], color[2]);
+        if let Some(t) = self.grain.get(&key) {
             return t.clone();
         }
         let size = 96usize;
-        let mut state: u32 = 0x1234_5678;
+        let mut state: u32 = 0x1234_5678
+            ^ ((color[0] as u32) << 16)
+            ^ ((color[1] as u32) << 8)
+            ^ (color[2] as u32);
         let mut px = Vec::with_capacity(size * size * 4);
         for _ in 0..size * size {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             let r = (state >> 24) as u8;
-            if r < 60 {
-                px.extend([214u8, 208, 196, 26]);
-            } else if r < 90 {
-                px.extend([255u8, 255, 250, 20]);
-            } else {
-                px.extend([0u8, 0, 0, 0]);
+            let mut f = 1.0 + (r as f32 / 255.0 - 0.5) * 0.11;
+            if r < 28 {
+                f *= 0.85; // sparse darker fleck
+            } else if r > 235 {
+                f *= 1.04; // sparse papery highlight
             }
+            let c = tinted(color, f);
+            px.extend([c.r(), c.g(), c.b(), 255]);
         }
         let ci = egui::ColorImage::from_rgba_unmultiplied([size, size], &px);
-        let tex = ctx.load_texture("glossa-paper-grain", ci, egui::TextureOptions::NEAREST_REPEAT);
-        self.grain = Some(tex.clone());
+        let tex = ctx.load_texture(format!("glossa-grain-{key}"), ci, egui::TextureOptions::NEAREST_REPEAT);
+        self.grain.insert(key, tex.clone());
         tex
     }
 
@@ -704,7 +711,7 @@ impl Reader {
         ui.advance_cursor_after_rect(grip_rect);
         let grip_resp = ui.interact(grip_rect, grip_id, Sense::click_and_drag());
 
-        let grain = self.ensure_grain(ui.ctx());
+        let grain = self.ensure_grain(ui.ctx(), card_fill);
         let painter = ui.painter().clone();
         let lifted = resp.dragged();
         paint_paper(&painter, card, egui::util::hash(ann.id.clone()), card_fill, &grain, lifted);
@@ -1270,7 +1277,7 @@ fn paint_paper(
     let scale = if lifted { 1.045 } else { 1.0 };
     let corners = paper_corners(card, seed, scale);
     let ear_idx = ((hash01(seed ^ 0xA5A5_A5A5) * 4.0) as usize) % 4;
-    let d = 15.0;
+    let d = 12.0;
 
     // fold crease endpoints along the curl's two edges
     let n1 = (ear_idx + 3) % 4;
@@ -1280,7 +1287,7 @@ fn paint_paper(
     let v2 = corners[n2] - corners[ear_idx];
     let e2 = corners[ear_idx] + v2 * (d / v2.length().max(1.0));
     let mid = Pos2::new((e1.x + e2.x) * 0.5, (e1.y + e2.y) * 0.5);
-    let apex = mid + (card.center() - mid) * 0.5;
+    let apex = mid + (card.center() - mid) * 0.38;
 
     // ambient shadow (lifts off while dragging)
     let l = if lifted { 1.0 } else { 0.0 };
