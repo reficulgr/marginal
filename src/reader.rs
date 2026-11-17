@@ -1161,7 +1161,18 @@ impl Reader {
 
         // the anchor dot on the page edge is itself draggable: grabbing it
         // re-targets which passage this marginalia points at
-        let anchor_pt = pos2(page_rect.left(), y_screen);
+        // anchor mirrors with the sheet: left sheets anchor on their right
+        // (spine-side) edge, right sheets on their left edge — the thread
+        // always crosses the full page as the underline
+        let anchor_on_right = strip.right() <= page_rect.left() + 1.0;
+        let anchor_pt = pos2(
+            if anchor_on_right {
+                page_rect.right()
+            } else {
+                page_rect.left()
+            },
+            y_screen,
+        );
         let dot_id = egui::Id::unique(("margin-anchor", ann.id.clone()));
         let dot_rect = Rect::from_center_size(anchor_pt, vec2(14.0, 14.0));
         ui.advance_cursor_after_rect(dot_rect);
