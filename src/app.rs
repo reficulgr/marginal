@@ -55,11 +55,29 @@ impl GlossaApp {
         });
         crate::theme::register_fonts(&cc.egui_ctx);
 
+        // test/automation hook: GLOSSA_OPEN=<book_id>:<page> opens straight into
+        // the reader (used by the screenshot-based style workflow)
+        let mut mode = Mode::Library;
+        let mut reader = None;
+        if let Ok(spec) = std::env::var("GLOSSA_OPEN") {
+            let spec = spec.trim().to_string();
+            if let Some((id_s, page_s)) = spec.split_once(':') {
+                if let (Ok(id), Ok(page)) = (id_s.parse::<i64>(), page_s.parse::<u32>()) {
+                    if let Ok(book) = crate::store::with_store(&store, |s| s.book_by_id(id)) {
+                        let mut r = Reader::open(store.clone(), book);
+                        r.go_to_page(page);
+                        reader = Some(r);
+                        mode = Mode::Reader;
+                    }
+                }
+            }
+        }
+
         Ok(GlossaApp {
             store,
-            mode: Mode::Library,
+            mode,
             library,
-            reader: None,
+            reader,
             scan_rx: None,
             status: ScanStatus::Idle,
             errors_pending: Vec::new(),
