@@ -98,12 +98,15 @@ pub enum Anchor {
     /// Sticky note: a red pin somewhere on the page plus the card hanging
     /// on the desk beside it (may be fully outside the page rectangle).
     PostIt {
-        /// pin position, normalized to the page (0..1)
+        /// pin position, normalized to the page (0..1) — semantic, shared by views
         x: f32,
         y: f32,
-        /// where the card hangs, normalized (may be <0 or >1)
+        /// user-placed card position in SINGLE-page view (absent = auto-hang)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<[f32; 2]>,
+        /// user-placed card position in SPREAD (book) view (absent = auto-hang)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card_s: Option<[f32; 2]>,
         /// user-set card size in px [w, h]; zero/absent = pad default
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<[f32; 2]>,

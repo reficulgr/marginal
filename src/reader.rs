@@ -45,6 +45,8 @@ pub struct Reader {
     annotations: Vec<Annotation>,
     /// pan offset of the whole desk (space+drag, wheel) in screen px
     pan: Vec2,
+    /// book (facing pages) mode
+    facing: bool,
     /// paper grain texture, generated once
     grain: std::collections::HashMap<String, egui::TextureHandle>,
     /// blurred shadow sprite, generated once
@@ -69,7 +71,17 @@ impl Reader {
         let annotations = crate::store::with_store(&store, |s| s.annotations_for_book(book.id))
             .unwrap_or_default();
         crate::store::with_store(&store, |s| s.touch_opened(book.id)).ok();
-        let mut reader = Reader {
+        // book-view preference
+        let facing_pref = {
+            let stored = crate::store::with_store(&store, |s| s.get_meta("facing"))
+                .ok()
+                .flatten()
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            stored || std::env::var("GLOSSA_FACING").ok().as_deref() == Some("1")
+        };
+        let reader = Reader {
+            facing: facing_pref,
             store,
             book,
             doc,
@@ -90,68 +102,138 @@ impl Reader {
             toast_at: 0.0,
             pending_jump: None,
         };
-        reader.migrate_postit_cards();
+        
         reader
     }
 
+    /// Toolbar toggle target: the odd (right-hand) page of the spread that
+    /// contains p — or p for lone pages. In single mode, p itself.
+    fn anchor_for_mode(&self, p: u32, facing: bool) -> u32 {
+        let count = self.page_count.max(1);
+        if !facing {
+            return p.clamp(1, count);
+        }
+        let p = p.clamp(1, count);
+        if p <= 1 {
+            1
+        } else if p % 2 == 1 {
+            p
+        } else if p + 1 <= count {
+            p + 1
+        } else {
+            p // lone even last page
+        }
+    }
+
+    /// Visible sheets in the current mode: left/right slots with book pairing.
+    fn spread_pair(&self) -> (Option<u32>, Option<u32>) {
+        let p = self.page;
+        let count = self.page_count.max(1);
+        if !self.facing {
+            return (Some(p), None);
+        }
+        if p <= 1 {
+            (None, Some(1))
+        } else if p % 2 == 1 {
+            (Some(p - 1), Some(p))
+        } else if p + 1 <= count {
+            (Some(p), Some(p + 1))
+        } else {
+            (Some(p), None) // lone even last page sits on the left
+        }
+    }
+
+    /// Counter label for the current view.
+    fn page_label(&self) -> String {
+        if !self.facing {
+            return format!("{}/{}", self.page, self.page_count);
+        }
+        match self.spread_pair() {
+            (Some(l), Some(r)) => format!("{l}–{r} / {}", self.page_count),
+            (None, Some(r)) => format!("{r} / {}", self.page_count),
+            (Some(l), None) => format!("{l} / {}", self.page_count),
+            (None, None) => String::new(),
+        }
+    }
+
     pub fn go_to_page(&mut self, page: u32) {
-        self.page = page.clamp(1, self.page_count.max(1));
+        self.page = self.anchor_for_mode(page.clamp(1, self.page_count.max(1)), self.facing);
     }
 
     /// Give legacy post-its (anchor-only) a hung card position, and stack
     /// cards on the same side so they don't overlap.
-    fn migrate_postit_cards(&mut self) {
-        let indexes: Vec<usize> = self
-            .annotations
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| {
-                matches!(&a.anchor, Anchor::PostIt { card: None, .. })
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in indexes {
-            self.annotations[i].anchor = self.hang_off_card_pos(i, 0.24, 0.15);
-            self.save_annotation(self.annotations[i].clone());
-        }
-    }
+    /// Auto-hug: positions for every post-it card that has no user-set
+    /// position in the CURRENT view mode — hung just outside the page's
+    /// fitting edge, stacked per side. User-placed cards register too, so
+    /// autos flow around them.
+    fn compute_auto_hangs(
+        &self,
+        page_anns: &[Annotation],
+        page_rect: Rect,
+        default_size: [f32; 2],
+    ) -> std::collections::HashMap<String, [f32; 2]> {
+        let mut out = std::collections::HashMap::new();
+        let pw = page_rect.width().max(1.0);
+        let ph = page_rect.height().max(1.0);
+        let mut left_stack: Vec<f32> = Vec::new();
+        let mut right_stack: Vec<f32> = Vec::new();
 
-    /// Card position hanging outside the page for post-it [i] (by index):
-    /// side picked by pin x, vertically centered near the pin row, nudged
-    /// downward past other cards on the same side.
-    /// `w_norm`/`h_norm` = card width/height as fractions of the page size.
-    fn hang_off_card_pos(&self, index: usize, w_norm: f32, h_norm: f32) -> Anchor {
-        let ann = &self.annotations[index];
-        let Anchor::PostIt { x, y, size, .. } = ann.anchor else {
-            return ann.anchor.clone();
-        };
-        let left = x <= 0.5;
-        let cx = if left { -w_norm - 0.01 } else { 1.01 };
-        let mut cy = (y - h_norm * 0.45).max(-0.4);
-        for _ in 0..12 {
-            let overlapping = self.annotations.iter().any(|other| {
-                if let Anchor::PostIt {
-                    card: Some([_, oy]),
-                    x: ox,
-                    ..
-                } = other.anchor
-                {
-                    (ox <= 0.5) == left && (oy - cy).abs() < h_norm + 0.02
+        // pass 1: register user-placed cards (current mode) as fixed
+        for ann in page_anns {
+            let Anchor::PostIt { x, card, card_s, .. } = ann.anchor else { continue };
+            let user_slot = if self.facing { card_s } else { card };
+            if let Some([_, cy]) = user_slot {
+                if x <= 0.5 {
+                    left_stack.push(cy);
                 } else {
-                    false
+                    right_stack.push(cy);
                 }
-            });
-            if !overlapping {
-                break;
             }
-            cy += h_norm + 0.02;
         }
-        Anchor::PostIt {
-            x,
-            y,
-            card: Some([cx, cy]),
-            size,
+
+        // pass 2: hang autos in creation order, flowing past whatever exists
+        for ann in page_anns {
+            let Anchor::PostIt {
+                x,
+                y,
+                card,
+                card_s,
+                size,
+            } = ann.anchor
+            else {
+                continue;
+            };
+            let user_slot = if self.facing { card_s } else { card };
+            match user_slot {
+                Some(pos) => {
+                    out.insert(ann.id.clone(), pos);
+                }
+                None => {
+                    let [w, h] = size.unwrap_or(default_size);
+                    let w = w.max(default_size[0]);
+                    let h = h.max(default_size[1]);
+                    let left = x <= 0.5;
+                    let cx = if left { -(w + 18.0) / pw } else { 1.0 + 18.0 / pw };
+                    let stack = if left { &left_stack } else { &right_stack };
+                    let h_frac = (h + 10.0) / ph;
+                    let mut y_c = (y - h_frac * 0.4).clamp(-0.15, 1.1 - h_frac);
+                    for _ in 0..40 {
+                        if !stack.iter().any(|&oy| (oy - y_c).abs() < h_frac + 0.012) {
+                            break;
+                        }
+                        y_c += h_frac + 0.012;
+                    }
+                    let cy = y_c.min(1.12 - h_frac).max(-0.18);
+                    if left {
+                        left_stack.push(cy);
+                    } else {
+                        right_stack.push(cy);
+                    }
+                    out.insert(ann.id.clone(), [cx, cy]);
+                }
+            }
         }
+        out
     }
 
     /// Minimum card size: ~15 characters wide by 7 lines tall (font-truthful),
@@ -219,14 +301,28 @@ impl Reader {
                 }
                 ui.separator();
 
+                let facing_label = if self.facing { "📖 ✓" } else { "📖" };
+                if ui
+                    .button(facing_label)
+                    .on_hover_text("facing pages (book view)")
+                    .clicked()
+                {
+                    self.facing = !self.facing;
+                    self.page = self.anchor_for_mode(self.page, self.facing);
+                    crate::store::with_store(&self.store, |s| {
+                        s.set_meta("facing", if self.facing { "1" } else { "0" })
+                    })
+                    .ok();
+                }
+                let step = if self.facing { 2 } else { 1 };
                 let prev = ui.button("◀").clicked();
-                ui.label(format!("{}/{}", self.page, self.page_count));
+                ui.label(self.page_label());
                 let next = ui.button("▶").clicked();
                 if prev {
-                    self.page = self.page.saturating_sub(1).max(1);
+                    self.page = self.page.saturating_sub(step).max(1);
                 }
                 if next {
-                    self.page = (self.page + 1).min(self.page_count.max(1));
+                    self.page = (self.page + step).min(self.page_count.max(1));
                 }
 
                 ui.separator();
@@ -324,8 +420,7 @@ impl Reader {
                 i.pointer.middle_down(),
             )
         });
-        let pan_now = !editing_active
-            && ((space_down && primary_down) || middle_down);
+        let pan_now = !editing_active && ((space_down && primary_down) || middle_down);
         if pan_now && drag_delta != Vec2::ZERO {
             self.pan += drag_delta;
         }
@@ -335,7 +430,6 @@ impl Reader {
                 self.pan += wheel;
             }
         }
-        // hand cursor while space or middle button is active (not while typing)
         if !editing_active && (space_down || middle_down) {
             ui.ctx().set_cursor_icon(if pan_now {
                 egui::CursorIcon::Grabbing
@@ -353,68 +447,156 @@ impl Reader {
                 i.key_pressed(Key::End),
             )
         });
+        let step = if self.facing { 2 } else { 1 };
         if pgup {
-            self.page = self.page.saturating_sub(1).max(1);
+            self.page = self.page.saturating_sub(step).max(1);
         }
         if pgdn {
-            self.page = (self.page + 1).min(self.page_count.max(1));
+            self.page = (self.page + step).min(self.page_count.max(1));
         }
         if home {
             self.page = 1;
         }
         if end {
-            self.page = self.page_count.max(1);
+            self.page = self.anchor_for_mode(self.page_count.max(1), self.facing);
         }
 
-        let tex = self.ensure_page_texture(ui.ctx());
+        let postit_min = self.card_min_size(ui);
 
-        let Some(tex) = tex else {
-            ui.centered_and_justified(|ui| {
-                let msg: String = if self.doc.is_none() {
-                    format!("Could not open PDF:\n{}", self.book.path)
-                } else {
-                    "Rendering page…".to_string()
-                };
-                ui.label(msg);
-            });
-            return;
-        };
-
+        // page geometry from the anchor page (pages share the fit)
         let page_pts = self
             .doc
             .as_ref()
-            .map(|d| d.page_size(self.page - 1))
+            .map(|d| d.page_size(self.page.saturating_sub(1) as u32))
             .unwrap_or(Ok((595.0, 842.0)))
             .unwrap_or((595.0, 842.0));
+        let page_size = {
+            let avail_h = ui.available_height() - 24.0;
+            let scale = (avail_h / page_pts.1).max(0.05) * self.zoom;
+            vec2(page_pts.0 * scale, page_pts.1 * scale)
+        };
 
-        let avail_h = ui.available_height() - 24.0;
-        let scale = (avail_h / page_pts.1).max(0.05) * self.zoom;
-        let page_size = vec2(page_pts.0 * scale, page_pts.1 * scale);
-
-        let page_annotations: Vec<Annotation> = self
-            .annotations
-            .iter()
-            .filter(|a| a.page == self.page)
-            .cloned()
-            .collect();
-        let has_margin_notes = page_annotations
-            .iter()
-            .any(|a| matches!(a.anchor, Anchor::Margin { .. }));
-
-        // the page floats at the top-center of the desk, shifted by pan
+        // visible sheets: single = one sheet; book = left+right with a gutter
         let avail = ui.max_rect();
-        let page_rect = Rect::from_min_size(
-            pos2(
-                avail.center().x - page_size.x * 0.5 + self.pan.x,
-                avail.top() + 28.0 + self.pan.y,
-            ),
-            page_size,
-        );
+        let gutter = 34.0;
+        let y0 = avail.top() + 28.0 + self.pan.y;
+        let cx_center = avail.center().x + self.pan.x;
 
-        // ----- page -----
-        let page_id = egui::Id::unique(("reader-page", self.book.id));
-        ui.advance_cursor_after_rect(page_rect);
-        let resp = ui.interact(page_rect, page_id, Sense::click());
+        struct Sheet {
+            page_no: u32,
+            rect: Rect,
+            strip_left: bool, // marginalia hangs on the outer (left) edge
+        }
+        let mut sheets: Vec<Sheet> = Vec::new();
+        if !self.facing {
+            sheets.push(Sheet {
+                page_no: self.page,
+                rect: Rect::from_min_size(
+                    pos2(cx_center - page_size.x * 0.5, y0),
+                    page_size,
+                ),
+                strip_left: false,
+            });
+        } else {
+            let (left, right) = self.spread_pair();
+            match (left, right) {
+                (Some(l), Some(r)) => {
+                    let total = page_size.x * 2.0 + gutter;
+                    let x0 = cx_center - total * 0.5;
+                    sheets.push(Sheet {
+                        page_no: l,
+                        rect: Rect::from_min_size(pos2(x0, y0), page_size),
+                        strip_left: true,
+                    });
+                    sheets.push(Sheet {
+                        page_no: r,
+                        rect: Rect::from_min_size(pos2(x0 + page_size.x + gutter, y0), page_size),
+                        strip_left: false,
+                    });
+                    let _ = total;
+                }
+                (None, Some(r)) => {
+                    let x = cx_center + gutter * 0.5;
+                    sheets.push(Sheet {
+                        page_no: r,
+                        rect: Rect::from_min_size(pos2(x, y0), page_size),
+                        strip_left: false,
+                    });
+                }
+                (Some(l), None) => {
+                    let x = cx_center - gutter * 0.5 - page_size.x;
+                    sheets.push(Sheet {
+                        page_no: l,
+                        rect: Rect::from_min_size(pos2(x, y0), page_size),
+                        strip_left: true,
+                    });
+                }
+                (None, None) => {}
+            }
+        }
+
+        let clicks_enabled = !pan_now;
+
+        // draw each sheet (annotations ride along, per page)
+        let mut sheet_data: Vec<(u32, Rect, Vec<Annotation>)> = Vec::new();
+        for sheet in &sheets {
+            let page_anns: Vec<Annotation> = self
+                .annotations
+                .iter()
+                .filter(|a| a.page == sheet.page_no)
+                .cloned()
+                .collect();
+            self.draw_sheet(
+                ui,
+                sheet.page_no,
+                sheet.rect,
+                sheet.strip_left,
+                &page_anns,
+                postit_min,
+                clicks_enabled,
+            );
+            sheet_data.push((sheet.page_no, sheet.rect, page_anns));
+        }
+
+        // links across visible sheets
+        self.draw_link_overlays(ui, &sheet_data);
+
+        // link picker dialog
+        if let Some(mut dialog) = self.link_dialog.take() {
+            links::show_dialog(ui.ctx(), self.store.clone(), &mut dialog);
+            if !dialog.open {
+                if let Some((src, target)) = dialog.result.take() {
+                    crate::store::with_store(&self.store, |s| s.insert_link(&src, &target)).ok();
+                }
+            } else {
+                self.link_dialog = Some(dialog);
+            }
+        }
+    }
+
+    /// One physical page on the desk: shadow, paper, texture, interaction,
+    /// pins + cards + marginalia for that page.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sheet(
+        &mut self,
+        ui: &mut Ui,
+        page_no: u32,
+        page_rect: Rect,
+        strip_left: bool,
+        page_anns: &[Annotation],
+        postit_min: [f32; 2],
+        allow_clicks: bool,
+    ) {
+        let Some(tex) = self.ensure_page_texture(ui.ctx(), page_no) else {
+            ui.painter().text(
+                page_rect.center(),
+                Align2::CENTER_CENTER,
+                "…",
+                FontId::proportional(20.0),
+                Color32::from_rgb(120, 120, 120),
+            );
+            return;
+        };
 
         ui.painter().rect_filled(
             page_rect.translate(vec2(6.0, 8.0)),
@@ -429,7 +611,11 @@ impl Reader {
             Color32::WHITE,
         );
 
-        // armed creation hint + click (clicks are suppressed while space-panning)
+        // page interaction: armed hint + creation (space-pan suppresses clicks)
+        let page_id = egui::Id::unique(("reader-page", self.book.id, page_no));
+        ui.advance_cursor_after_rect(page_rect);
+        let resp = ui.interact(page_rect, page_id, Sense::click());
+
         if self.armed.is_some() {
             if let Some(p) = resp.hover_pos() {
                 let hint = match self.armed {
@@ -446,59 +632,54 @@ impl Reader {
                 );
             }
         }
-        let space_down_now = space_down;
-        if resp.clicked() && !space_down_now {
+        if resp.clicked() && allow_clicks {
             if let Some(p) = resp.hover_pos() {
-                let postit_min = self.card_min_size(ui);
-                self.on_page_clicked(p, page_rect, postit_min);
+                self.on_page_clicked(p, page_rect, page_no, postit_min);
             }
         }
 
-        // ----- post-its: pins + hanging cards -----
-        for ann in &page_annotations {
+        // post-its: pins + auto-hanging cards
+        let auto_hang = self.compute_auto_hangs(page_anns, page_rect, postit_min);
+        for ann in page_anns {
             if let Anchor::PostIt { .. } = ann.anchor {
-                self.draw_postit(ui, ann, page_rect);
+                let auto = auto_hang.get(&ann.id).copied();
+                self.draw_postit(ui, ann, page_rect, auto);
             }
         }
 
-        // ----- marginalia: chalk hanging beside the page -----
+        // marginalia: chalk in the outer margin of the spread
+        let has_margin_notes = page_anns
+            .iter()
+            .any(|a| matches!(a.anchor, Anchor::Margin { .. }));
         if has_margin_notes {
-            let strip_rect = Rect::from_min_size(
-                pos2(page_rect.right(), page_rect.top()),
-                vec2(MARGIN_STRIP_W, page_size.y),
-            );
-            for ann in &page_annotations {
+            let strip_rect = if strip_left {
+                Rect::from_min_size(
+                    pos2(page_rect.left() - MARGIN_STRIP_W, page_rect.top()),
+                    vec2(MARGIN_STRIP_W, page_rect.height()),
+                )
+            } else {
+                Rect::from_min_size(
+                    pos2(page_rect.right(), page_rect.top()),
+                    vec2(MARGIN_STRIP_W, page_rect.height()),
+                )
+            };
+            for ann in page_anns {
                 if let Anchor::Margin { .. } = ann.anchor {
                     self.draw_margin_note(ui, ann, strip_rect, page_rect);
                 }
             }
         }
-
-        // connectors + markers drawn last (topmost)
-        self.draw_link_overlays(ui, &page_annotations, page_rect);
-
-        // link picker dialog
-        if let Some(mut dialog) = self.link_dialog.take() {
-            links::show_dialog(ui.ctx(), self.store.clone(), &mut dialog);
-            if !dialog.open {
-                if let Some((src, target)) = dialog.result.take() {
-                    crate::store::with_store(&self.store, |s| s.insert_link(&src, &target)).ok();
-                }
-            } else {
-                self.link_dialog = Some(dialog);
-            }
-        }
     }
 
-    fn ensure_page_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.page_tex_cache.get(&self.page) {
+    fn ensure_page_texture(&mut self, ctx: &egui::Context, page_no: u32) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.page_tex_cache.get(&page_no) {
             return Some(t.tex.clone());
         }
         let doc = self.doc.as_ref()?;
         let quality: u32 = (ctx.pixels_per_point() * 1.7)
             .max(1100.0)
             .min(2000.0) as u32;
-        let img: PageImage = match doc.render((self.page - 1) as u32, quality) {
+        let img: PageImage = match doc.render((page_no - 1) as u32, quality) {
             Ok(img) => img,
             Err(e) => {
                 self.error = Some(format!("render failed: {e}"));
@@ -510,17 +691,17 @@ impl Reader {
             &img.rgba,
         );
         let tex = ctx.load_texture(
-            format!("glossa-page-{}-{}", self.book.id, self.page),
+            format!("glossa-page-{}-{}", self.book.id, page_no),
             color,
             egui::TextureOptions::LINEAR,
         );
         self.page_tex_cache
-            .insert(self.page, PageTex { tex: tex.clone() });
+            .insert(page_no, PageTex { tex: tex.clone() });
         while self.page_tex_cache.len() > 6 {
             let victim = self
                 .page_tex_cache
                 .keys()
-                .find(|k| **k != self.page)
+                .find(|k| **k != page_no)
                 .copied();
             match victim {
                 Some(k) => {
@@ -592,6 +773,7 @@ impl Reader {
         &mut self,
         p: Pos2,
         page_rect: Rect,
+        page_no: u32,
         default_size: [f32; 2],
     ) {
         let Some(mode) = self.armed else { return };
@@ -604,6 +786,7 @@ impl Reader {
                     x: nx,
                     y: ny,
                     card: None,
+                    card_s: None,
                     size: Some(default_size),
                 },
                 "yellow",
@@ -612,7 +795,7 @@ impl Reader {
         };
         let ann = Annotation {
             id: uuid::Uuid::new_v4().to_string(),
-            page: self.page,
+            page: page_no,
             anchor,
             body: String::new(),
             color: default_color.into(),
@@ -621,14 +804,7 @@ impl Reader {
         };
         crate::store::with_store(&self.store, |s| s.insert_annotation(self.book.id, &ann)).ok();
         self.annotations.push(ann.clone());
-        // post-its: hang the card off the pin, stacked to avoid clutter
-        if let Anchor::PostIt { .. } = ann.anchor {
-            let i = self.annotations.len() - 1;
-            let w_norm = (default_size[0] + 16.0) / page_rect.width();
-            let h_norm = (default_size[1] + 12.0) / page_rect.height();
-            self.annotations[i].anchor = self.hang_off_card_pos(i, w_norm, h_norm);
-            self.save_annotation(self.annotations[i].clone());
-        }
+        // cards auto-hug on draw; the user's own drags freeze them per view mode
         self.armed = None;
         self.editing = Some(EditingNote {
             id: ann.id,
@@ -643,16 +819,26 @@ impl Reader {
     /// A post-it = a red pin on the page + a paper card hanging on the desk,
     /// joined by a faint dashed thread. Analog paper: hand-tilted silhouette,
     /// dog-ear curl, layered shadow, grain, elastic ink-height, resize grip.
-    fn draw_postit(&mut self, ui: &mut Ui, ann: &Annotation, page_rect: Rect) {
+    fn draw_postit(
+        &mut self,
+        ui: &mut Ui,
+        ann: &Annotation,
+        page_rect: Rect,
+        auto: Option<[f32; 2]>,
+    ) {
         let Anchor::PostIt {
             x,
             y,
-            card: Some([cx, cy]),
+            card,
+            card_s,
             size: size_stored,
         } = ann.anchor
         else {
             return;
         };
+        // per-view-mode slot: user-set position wins, else auto-hug the pin
+        let user_slot = if self.facing { card_s } else { card };
+        let [cx, cy] = user_slot.or(auto).unwrap_or([0.4, 0.0]);
 
         // ---- size: user choice, floor = pad minimum, ceiling = the ink ----
         let [min_w, min_h] = self.card_min_size(ui);
@@ -830,17 +1016,21 @@ impl Reader {
             ui.painter().galley(card.min + vec2(pad, pad) + wob, g, Color32::from_rgb(40, 40, 40));
         }
 
-        // drag the card anywhere on the desk
+        // drag the card anywhere on the desk — freezes the auto-hang spot
+        // FOR THIS VIEW MODE only (single and spread keep separate memories)
         if resp.dragged() {
             let delta = resp.drag_delta();
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
-            if let Anchor::PostIt {
-                card: Some([cx, cy]),
-                ..
-            } = &mut moved.anchor
-            {
-                *cx += delta.x / page_rect.width();
-                *cy += delta.y / page_rect.height();
+            if let Anchor::PostIt { card, card_s, .. } = &mut moved.anchor {
+                let new_pos = [
+                    cx + delta.x / page_rect.width(),
+                    cy + delta.y / page_rect.height(),
+                ];
+                if self.facing {
+                    *card_s = Some(new_pos);
+                } else {
+                    *card = Some(new_pos);
+                }
             }
             self.save_annotation(moved);
         }
@@ -1061,46 +1251,51 @@ impl Reader {
     }
 
     /// Draw note↔note link curves for annotations on this page.
-    fn draw_link_overlays(&mut self, ui: &mut Ui, page_annotations: &[Annotation], page_rect: Rect) {
-        let links =
-            crate::store::with_store(&self.store, |s| s.links_of_book(self.book.id))
-                .unwrap_or_default();
+    fn draw_link_overlays(&mut self, ui: &mut Ui, sheets: &[(u32, Rect, Vec<Annotation>)]) {
+        let links = crate::store::with_store(&self.store, |s| s.links_of_book(self.book.id))
+            .unwrap_or_default();
         let active_src = self
             .link_dialog
             .as_ref()
             .map(|d| d.from.clone())
             .unwrap_or_default();
 
+        // resolve every annotation id to its on-desk focus point
+        let mut placed: Vec<(String, Pos2)> = Vec::new();
+        for (_page_no, rect, anns) in sheets {
+            for a in anns {
+                placed.push((a.id.clone(), card_focus(a, *rect)));
+            }
+        }
+
         for (src, _link_id, target) in &links {
-            let Some(src_ann) = page_annotations.iter().find(|a| &a.id == src) else { continue };
+            let src_pos = placed.iter().find(|(id, _)| id == src).map(|(_, p)| *p);
             match target {
                 LinkTarget::Annotation(dst) => {
-                    let Some(dst_ann) = page_annotations.iter().find(|a| &a.id == dst) else { continue };
-                    let seed = egui::util::hash((src.clone(), dst.clone()));
-                    links::hand_dashed_line(
-                        &ui.painter().clone(),
-                        card_focus(src_ann, page_rect),
-                        card_focus(dst_ann, page_rect),
-                        seed,
-                        Color32::from_rgb(125, 95, 170),
-                    );
+                    let dst_pos = placed.iter().find(|(id, _)| id == dst).map(|(_, p)| *p);
+                    if let (Some(a), Some(b)) = (src_pos, dst_pos) {
+                        links::hand_dashed_line(
+                            &ui.painter().clone(),
+                            a,
+                            b,
+                            egui::util::hash((src.clone(), dst.clone())),
+                            Color32::from_rgb(125, 95, 170),
+                        );
+                    }
                 }
                 _ if src == &active_src => {
-                    // the note being linked elsewhere (page or URL) gets a marker dot
-                    ui.painter().circle_filled(
-                        card_focus(src_ann, page_rect),
-                        7.0,
-                        Color32::from_rgba_unmultiplied(125, 95, 170, 140),
-                    );
+                    if let Some(a) = src_pos {
+                        ui.painter().circle_filled(
+                            a,
+                            7.0,
+                            Color32::from_rgba_unmultiplied(125, 95, 170, 140),
+                        );
+                    }
                 }
                 _ => {}
             }
         }
     }
-
-    // ==================================================================
-    // Links side panel
-    // ==================================================================
 
     fn links_panel(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
