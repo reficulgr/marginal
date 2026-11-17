@@ -18,6 +18,8 @@ pub const DOT_RADIUS: f32 = 1.15;
 pub const NOTE_CHALK: Color32 = Color32::from_rgb(238, 238, 234);
 /// Connector trail from the anchor dot to marginalia — pencil tone on the desk.
 pub const CONNECTOR: Color32 = Color32::from_rgb(43, 46, 51);
+/// Chapter marks on the ruler (soft amber/gold).
+pub const CHAPTER_MARK: Color32 = Color32::from_rgb(226, 186, 110);
 /// Post-it pins are always red.
 pub const PIN_RED: Color32 = Color32::from_rgb(226, 72, 72);
 /// Faint dashed thread between a post-it pin and its card (pencil, quite transparent).

@@ -86,6 +86,24 @@ impl OpenDoc {
         self.doc.pages().len() as u32
     }
 
+    /// Embedded outline ("bookmarks" tree): top-level entries only,
+    /// as (1-based page number, title).
+    pub fn outline(&self) -> Vec<(u32, String)> {
+        let count = self.doc.pages().len() as i32;
+        let mut out = Vec::new();
+        for bm in self.doc.bookmarks().iter() {
+            let title = bm.title().unwrap_or_default().trim().to_string();
+            if title.is_empty() {
+                continue;
+            }
+            let Some(dest) = bm.destination() else { continue };
+            let Ok(idx) = dest.page_index() else { continue };
+            let page = (idx.clamp(0, count - 1) + 1) as u32;
+            out.push((page, title));
+        }
+        out
+    }
+
     /// Page size in PDF points (1 pt = 1/72").
     pub fn page_size(&self, page_index: u32) -> Result<(f32, f32)> {
         let pages = self.doc.pages();

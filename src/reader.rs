@@ -57,6 +57,8 @@ pub struct Reader {
     grain: std::collections::HashMap<String, egui::TextureHandle>,
     /// blurred shadow sprite, generated once
     shadow: Option<egui::TextureHandle>,
+    /// chapter marks from the pdf outline: (1-based page, title)
+    chapter_marks: Vec<(u32, String)>,
 
     /// armed "click on page to add" mode
     armed: Option<ArmMode>,
@@ -74,6 +76,8 @@ impl Reader {
     pub fn open(store: SharedStore, book: BookMeta) -> Reader {
         let doc = OpenDoc::open(std::path::Path::new(&book.path)).ok();
         let page_count = doc.as_ref().map(|d| d.page_count()).unwrap_or(1).max(1);
+        let chapter_marks: Vec<(u32, String)> =
+            doc.as_ref().map(|d| d.outline()).unwrap_or_default();
         let annotations = crate::store::with_store(&store, |s| s.annotations_for_book(book.id))
             .unwrap_or_default();
         crate::store::with_store(&store, |s| s.touch_opened(book.id)).ok();
@@ -101,6 +105,7 @@ impl Reader {
             scrub_until: None,
             grain: Default::default(),
             shadow: None,
+            chapter_marks,
             armed: None,
             editing: None,
             link_dialog: None,
@@ -532,16 +537,36 @@ impl Reader {
                 0.0
             }
         };
+        // chapter marks: thin amber lines, twice the 10% tick height.
+        // Fractional stroke width (bright-on-dark + hi-dpi reads fatter),
+        // deduped when several chapters share a start page.
+        let mut last_chap_x: Option<f32> = None;
+        for (chg_page, _title) in self.chapter_marks.iter() {
+            if *chg_page > count {
+                continue;
+            }
+            let x = fx(frac_of(*chg_page));
+            if last_chap_x.map(|lx| (lx - x).abs() < 1.5).unwrap_or(false) {
+                continue;
+            }
+            painter.line_segment(
+                [pos2(x, ruler.bottom()), pos2(x, ruler.bottom() - 26.0)],
+                Stroke::new(0.6, crate::theme::CHAPTER_MARK),
+            );
+            last_chap_x = Some(x);
+        }
+
+        // current position: a 3px red bar centered over the page span
         if let (Some(first), Some(last)) = (marker_pages.first(), marker_pages.last()) {
-            let a = fx(frac_of(*first));
-            let b = fx(frac_of(*last));
+            let mid_frac = 0.5 * (frac_of(*first) + frac_of(*last));
+            let bx = fx(mid_frac);
             painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(a - 2.0, ruler.top() + 3.0),
-                    pos2(b + 2.0, ruler.bottom() - 2.0),
+                Rect::from_min_size(
+                    pos2(bx - 1.5, ruler.top() + 3.0),
+                    vec2(3.0, ruler.height() - 5.0),
                 ),
-                CornerRadius::same(2),
-                Color32::from_rgba_unmultiplied(226, 72, 72, 190),
+                CornerRadius::same(1),
+                crate::theme::PIN_RED,
             );
         }
 
@@ -564,9 +589,30 @@ impl Reader {
             if let Some(p) = resp.hover_pos() {
                 let frac = ((p.x - pad - ruler.left()) / tw).clamp(0.0, 1.0);
                 let preview = page_at(frac);
+                // nearest chapter mark within reach → title in the chip
+                let mut chapter: Option<String> = None;
+                for (chg_page, title) in self.chapter_marks.iter() {
+                    let dist = (fx(frac_of(*chg_page)) - p.x).abs();
+                    if dist < 10.0 {
+                        let short: String = title.chars().take(26).collect::<String>();
+                        chapter = Some(if title.chars().count() > 26 {
+                            format!("{short}…")
+                        } else {
+                            short
+                        });
+                        break;
+                    }
+                }
+                let (label, chip_w) = match &chapter {
+                    Some(t) => (format!("p.{preview} · {t}"), 12.0 * t.len() as f32 + 34.0),
+                    None => (format!("p.{preview}"), 36.0),
+                };
                 let label_rect = Rect::from_min_size(
-                    pos2((p.x - 18.0).max(ruler.left()), ruler.top() - 18.0),
-                    vec2(36.0, 15.0),
+                    pos2(
+                        ((p.x - chip_w * 0.5).max(ruler.left())).min(ruler.right() - chip_w),
+                        ruler.top() - 18.0,
+                    ),
+                    vec2(chip_w, 15.0),
                 );
                 painter.rect_filled(
                     label_rect,
@@ -576,7 +622,7 @@ impl Reader {
                 painter.text(
                     label_rect.center(),
                     Align2::CENTER_CENTER,
-                    format!("p.{preview}"),
+                    label,
                     FontId::proportional(9.0),
                     Color32::from_rgb(225, 227, 231),
                 );
@@ -1102,7 +1148,8 @@ impl Reader {
             None
         };
 
-        let card_fill = note_color_parts(&ann.color);
+        // cards run a touch paler since the v2 look pass
+        let card_fill = paler(note_color_parts(&ann.color), 0.22);
 
         // ----- red pin, draggable anywhere on the page -----
         let pin_id = egui::Id::unique(("postit-pin", ann.id.clone()));

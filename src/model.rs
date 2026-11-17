@@ -153,6 +153,15 @@ pub const NOTE_COLORS: [(&str, [u8; 3]); 5] = [
     ("orange", [250, 197, 142]),
 ];
 
+/// Lighten a color toward white by fraction t (0..1): paler paper.
+pub fn paler(c: [u8; 3], t: f32) -> [u8; 3] {
+    [
+        (c[0] as f32 + (255.0 - c[0] as f32) * t).min(255.0) as u8,
+        (c[1] as f32 + (255.0 - c[1] as f32) * t).min(255.0) as u8,
+        (c[2] as f32 + (255.0 - c[2] as f32) * t).min(255.0) as u8,
+    ]
+}
+
 pub fn note_color_parts(name: &str) -> [u8; 3] {
     NOTE_COLORS
         .iter()
