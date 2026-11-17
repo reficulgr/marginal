@@ -451,6 +451,14 @@ impl Reader {
                 });
         }
 
+        // page ruler (bottom): 2% steps, click / drag to jump
+        egui::Panel::bottom("reader_ruler")
+            .exact_size(30.0)
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                self.page_ruler(ui);
+            });
+
         // canvas
         egui::CentralPanel::default().show(ui, |ui| {
             self.canvas(ui);
@@ -460,6 +468,115 @@ impl Reader {
     // ==================================================================
     // Canvas
     // ==================================================================
+
+    /// Bottom ruler: a strip of tick marks, one every 2% of the page span
+    /// (longer every 10%), a red marker for the current position, and
+    /// click / drag-to-scrub navigation.
+    fn page_ruler(&mut self, ui: &mut Ui) {
+        let (rect, resp) =
+            ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click_and_drag());
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::ZERO, crate::theme::CHROME_BG);
+        painter.line_segment(
+            [pos2(rect.left(), rect.top()), pos2(rect.right(), rect.top())],
+            Stroke::new(1.0, Color32::from_rgb(70, 74, 82)),
+        );
+
+        let count = self.page_count.max(1);
+        let pad = 10.0;
+        let w = (rect.width() - 2.0 * pad).max(1.0);
+        let fx = |frac: f32| -> f32 { rect.left() + pad + frac * w };
+        let page_at = |frac: f32| -> u32 {
+            (1.0 + frac * (count as f32 - 1.0)).round().clamp(1.0, count as f32) as u32
+        };
+
+        // tick marks: minor every 2%, major every 10% with page labels
+        let mut pct = 0.0f32;
+        while pct <= 100.001 {
+            let frac = pct / 100.0;
+            let x = fx(frac);
+            let major = (pct as i32) % 10 == 0;
+            let tick_h = if major { 12.0 } else { 6.0 };
+            painter.line_segment(
+                [pos2(x, rect.bottom()), pos2(x, rect.bottom() - tick_h)],
+                Stroke::new(1.0, Color32::from_rgb(110, 114, 122)),
+            );
+            if major && count > 20 {
+                let page = page_at(frac);
+                painter.text(
+                    pos2(x, rect.top() + 2.0),
+                    Align2::CENTER_TOP,
+                    page.to_string(),
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(140, 144, 152),
+                );
+            }
+            pct += 2.0;
+        }
+
+        // current position marker (a small red bracket over the page span)
+        let marker_pages: Vec<u32> = if self.facing {
+            let (l, r) = self.spread_pair();
+            [l, r].into_iter().flatten().collect()
+        } else {
+            vec![self.page]
+        };
+        let frac_of = |page_no: u32| -> f32 {
+            if count > 1 {
+                ((page_no as f32 - 1.0) / (count as f32 - 1.0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        if let (Some(first), Some(last)) = (marker_pages.first(), marker_pages.last()) {
+            let a = fx(frac_of(*first));
+            let b = fx(frac_of(*last));
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(a - 2.0, rect.top() + 4.0),
+                    pos2(b + 2.0, rect.bottom() - 2.0),
+                ),
+                CornerRadius::same(2),
+                Color32::from_rgba_unmultiplied(226, 72, 72, 200),
+            );
+        }
+
+        // click / drag-scrub navigation
+        if resp.clicked() || resp.dragged() {
+            if let Some(p) = resp.hover_pos().or(ui.input(|i| i.pointer.interact_pos())) {
+                let frac = ((p.x - pad - rect.left()) / w).clamp(0.0, 1.0);
+                let target = page_at(frac);
+                if target != self.page {
+                    self.go_to_page(target);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        // hover: preview the page under the pointer
+        if resp.hovered() && !resp.dragged() {
+            if let Some(p) = resp.hover_pos() {
+                let frac = ((p.x - pad - rect.left()) / w).clamp(0.0, 1.0);
+                let preview = page_at(frac);
+                let label_rect = Rect::from_min_size(
+                    pos2((p.x - 18.0).max(rect.left()), rect.top() + 1.0),
+                    vec2(36.0, 14.0),
+                );
+                painter.rect_filled(
+                    label_rect,
+                    CornerRadius::same(3),
+                    Color32::from_rgb(60, 64, 72),
+                );
+                painter.text(
+                    label_rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("p.{preview}"),
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(220, 222, 226),
+                );
+            }
+        }
+    }
 
     fn canvas(&mut self, ui: &mut Ui) {
         // charcoal + dot grid backdrop, behind everything
