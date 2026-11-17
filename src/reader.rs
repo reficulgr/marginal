@@ -558,17 +558,13 @@ impl Reader {
             last_chap_x = Some(x);
         }
 
-        // current position: a 3px red bar centered over the page span
+        // current position: a red hairline (0.4pt) centered over the spread
         if let (Some(first), Some(last)) = (marker_pages.first(), marker_pages.last()) {
             let mid_frac = 0.5 * (frac_of(*first) + frac_of(*last));
             let bx = fx(mid_frac);
-            painter.rect_filled(
-                Rect::from_min_size(
-                    pos2(bx - 1.5, ruler.top() + 3.0),
-                    vec2(3.0, ruler.height() - 5.0),
-                ),
-                CornerRadius::same(1),
-                crate::theme::PIN_RED,
+            painter.line_segment(
+                [pos2(bx, ruler.top() + 2.0), pos2(bx, ruler.bottom() - 1.0)],
+                Stroke::new(0.4, crate::theme::PIN_RED),
             );
         }
 
