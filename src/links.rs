@@ -37,9 +37,12 @@ impl LinkDialog {
 }
 
 pub fn show_dialog(ctx: &egui::Context, store: SharedStore, d: &mut LinkDialog) {
-    let mut open = d.open;
+    // `chrome_open` follows the window's ✕; `wants_close` is set by the
+    // in-dialog buttons. The two are merged exactly once, after the body.
+    let mut chrome_open = d.open;
+    let mut wants_close = false;
     egui::Window::new("Add link")
-        .open(&mut open)
+        .open(&mut chrome_open)
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -110,36 +113,73 @@ pub fn show_dialog(ctx: &egui::Context, store: SharedStore, d: &mut LinkDialog) 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Link").clicked() {
-                    let target = match d.mode {
-                        0 => body.get(d.chosen_ann).map(|(id, _, _)| LinkTarget::Annotation(id.clone())),
-                        1 => {
-                            let page_v = d.page_input.trim().parse::<u32>().unwrap_or(d.page);
-                            let fp = if d.book_input.trim().is_empty() {
-                                d.book_fp.clone()
-                            } else {
-                                d.book_input.trim().to_string()
-                            };
-                            Some(LinkTarget::Page { book: fp, page: page_v.max(1) })
-                        }
-                        _ => {
-                            if !d.url.trim().is_empty() {
-                                Some(LinkTarget::Url(d.url.trim().to_string()))
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                    if let Some(t) = target {
-                        d.result = Some((d.from.clone(), t));
-                        d.open = false;
+                    let confirmed = confirm_link(d, &body);
+                    if confirmed {
+                        wants_close = true;
                     }
                 }
                 if ui.button("Cancel").clicked() {
-                    d.open = false;
+                    wants_close = true;
                 }
             });
         });
-    d.open = open;
+        // Decide the close state ONCE, after the body has run, and write it
+        // exactly once. The old code wrote `d.open = open` here with a stale
+        // snapshot, resurrecting every in-body close — so the "Link" and
+        // "Cancel" buttons appeared dead from the first commit on.
+        apply_close(d, chrome_open, wants_close);
+}
+
+/// The dialog's close-state merge, written exactly once: the window's ✕
+/// (`chrome_open`) and the in-dialog buttons (`wants_close`) decide together.
+fn apply_close(d: &mut LinkDialog, chrome_open: bool, wants_close: bool) {
+    d.open = chrome_open && !wants_close;
+}
+
+/// What the "Link" button does: builds the target from the dialog state and
+/// the current library snapshot (empty list means no target → stay open).
+/// Extracted so the close+result seam is testable without a display.
+fn confirm_link(d: &mut LinkDialog, body: &[(String, String, u32)]) -> bool {
+    let target = match d.mode {
+        0 => body
+            .get(d.chosen_ann)
+            .map(|(id, _, _)| LinkTarget::Annotation(id.clone())),
+        1 => {
+            let page_v = d.page_input.trim().parse::<u32>().unwrap_or(d.page);
+            let fp = if d.book_input.trim().is_empty() {
+                d.book_fp.clone()
+            } else {
+                d.book_input.trim().to_string()
+            };
+            Some(LinkTarget::Page { book: fp, page: page_v.max(1) })
+        }
+        _ => {
+            if !d.url.trim().is_empty() {
+                Some(LinkTarget::Url(d.url.trim().to_string()))
+            } else {
+                None
+            }
+        }
+    };
+    match target {
+        Some(t) => {
+            d.result = Some((d.from.clone(), t));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Links of a book, grouped under their source annotation in created_at
+/// order — the sidebar attaches each note's connections directly beneath it.
+pub fn group_by_src(
+    links: Vec<(String, String, LinkTarget)>,
+) -> std::collections::HashMap<String, Vec<(String, LinkTarget)>> {
+    let mut out = std::collections::HashMap::new();
+    for (src, link_id, target) in links {
+        out.entry(src).or_insert_with(Vec::new).push((link_id, target));
+    }
+    out
 }
 
 /// Human-readable description of a target for panels.
@@ -262,5 +302,88 @@ pub fn hand_dashed_line(
         }
         s = end_s;
         is_ink = !is_ink;
+    }
+}
+
+#[cfg(test)]
+mod dialog_seam_tests {
+    use super::*;
+
+    /// Regression for the born-broken dialog: the old code wrote
+    /// `d.open = open` with a stale snapshot AFTER the body ran, so the
+    /// "Link" / "Cancel" buttons could never close the dialog and every
+    /// confirmed link was lost. The fix merges the close state exactly once.
+    #[test]
+    fn link_button_confirms_and_closes() {
+        let mut d = LinkDialog::new("src-ann", "book-fp".to_string(), 7);
+        d.open = true;
+        d.mode = 2; // External URL
+        d.url = "https://example.com/page".into();
+
+        // the "Link" click: target builds, result is recorded, close wanted
+        let body: Vec<(String, String, u32)> = Vec::new();
+        assert!(confirm_link(&mut d, &body), "a URL mode with ink must confirm");
+        assert_eq!(
+            d.result,
+            Some(("src-ann".to_string(), LinkTarget::Url("https://example.com/page".into())))
+        );
+
+        // close merge: in-body close wins over the chrome snapshot (this is
+        // the seam that used to be `d.open = open`, resurrecting the dialog)
+        let mut d2 = LinkDialog::new("a", "fp".to_string(), 1);
+        d2.open = true;
+        apply_close(&mut d2, true, true);
+        assert!(!d2.open, "an in-dialog close must survive the merge");
+
+        // chrome ✕ alone closes too
+        apply_close(&mut d2, false, false);
+        assert!(!d2.open);
+
+        // and with neither, the dialog stays open
+        let mut d3 = LinkDialog::new("a", "fp".to_string(), 1);
+        d3.open = true;
+        apply_close(&mut d3, true, false);
+        assert!(d3.open);
+    }
+
+    /// "Link" with no valid target stays open (empty annotation list in note
+    /// mode; empty URL in URL mode) — the user gets to pick another mode.
+    #[test]
+    fn link_button_without_target_stays_open() {
+        let mut d = LinkDialog::new("s", "fp".to_string(), 3);
+        d.open = true;
+        d.mode = 2; // URL, but empty
+        let mut d = d;
+        assert!(!confirm_link(&mut d, &[]), "empty URL must not confirm");
+        apply_close(&mut d, true, false);
+        assert!(d.open, "dialog stays open when nothing confirmed");
+
+        let mut d_ann = LinkDialog::new("s", "fp".to_string(), 3);
+        d_ann.mode = 0; // note mode, empty library
+        assert!(!confirm_link(&mut d_ann, &[]));
+
+        // page mode always has a fallback page, so it confirms
+        let mut d_page = LinkDialog::new("s", "fp".to_string(), 3);
+        d_page.mode = 1;
+        assert!(confirm_link(&mut d_page, &[]));
+        assert_eq!(
+            d_page.result,
+            Some(("s".to_string(), LinkTarget::Page { book: "fp".into(), page: 3 }))
+        );
+    }
+
+    #[test]
+    fn links_group_under_their_source_in_order() {
+        let grouped = group_by_src(vec![
+            ("a".to_string(), "l1".to_string(), LinkTarget::Url("u1".into())),
+            ("b".to_string(), "l2".to_string(), LinkTarget::Url("u2".into())),
+            ("a".to_string(), "l3".to_string(), LinkTarget::Annotation("x".into())),
+        ]);
+        let a = grouped.get("a").unwrap();
+        assert_eq!(a.len(), 2, "both of a's links land under a");
+        assert_eq!(a[0].0, "l1", "created_at order kept within a source");
+        assert_eq!(a[1].0, "l3");
+        assert_eq!(grouped.get("b").unwrap().len(), 1);
+        assert!(!grouped.contains_key("c"), "sources without links get nothing");
     }
 }

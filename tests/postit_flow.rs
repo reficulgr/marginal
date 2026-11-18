@@ -132,6 +132,131 @@ fn card_hover_works() {
 }
 
 #[test]
+fn context_menu_keeps_hover_alive() {
+    // guards the right-click work: attaching a context menu to the card
+    // response must not cost the card its hover state
+    let ctx = Context::default();
+    let mut hud = card_hud();
+    let mut input = base_input();
+    mouse_move(&mut input, CARD.center());
+    for _ in 0..3 {
+        frame(&ctx, input.take(), |ui| {
+            ui.advance_cursor_after_rect(CARD);
+            let resp = ui.interact(CARD, egui::Id::unique(("m", "1")), Sense::click_and_drag());
+            resp.context_menu(|ui| {
+                if ui.button("Duplicate note").clicked() {
+                    ui.close();
+                }
+                if ui.button("Delete note").clicked() {
+                    ui.close();
+                }
+            });
+            hud.hovered = resp.hovered();
+        });
+    }
+    assert!(hud.hovered, "attaching a context menu must not break card hover");
+}
+
+/// The bar the reader draws above a hovered note.
+fn bar_rect() -> Rect {
+    let bar_h = 18.0_f32; // reader's BAR_H
+    Rect::from_min_size(
+        pos2(CARD.min.x, CARD.min.y - bar_h - 4.0),
+        vec2(CARD.width(), bar_h),
+    )
+}
+
+#[test]
+fn hover_bar_button_senses_input() {
+    let ctx = Context::default();
+    let mut input = base_input();
+    let bar = bar_rect();
+    let mut hovered = false;
+    let mut clicked = false;
+
+    let draw = |ui: &mut Ui, hovered: &mut bool, clicked: &mut bool| {
+        ui.advance_cursor_after_rect(CARD);
+        let resp = ui.interact(CARD, egui::Id::unique(("c", "1")), Sense::click_and_drag());
+        let bar_hovered = ui.rect_contains_pointer(bar) || ui.rect_contains_pointer(CARD);
+        let gate_open = resp.hovered() || bar_hovered;
+        // a neighbor drawn after the card, covering the bar zone (margin
+        // text, a ruler, a thread endpoint — the things that killed the bar)
+        ui.interact(
+            bar.translate(vec2(40.0, 2.0)),
+            egui::Id::unique(("nbr", "1")),
+            Sense::click_and_drag(),
+        );
+        // the hover-bar pass — last, so it can't be covered
+        if !gate_open {
+            return;
+        }
+        let cell = |ix: f32| {
+            Rect::from_min_size(pos2(bar.min.x + ix, bar.min.y), vec2(22.0, bar.height()))
+        };
+        let r = ui.put(cell(0.0), egui::Button::new("✎").small());
+        *hovered |= r.hovered();
+        *clicked |= r.clicked();
+        let _ = ui.put(cell(26.0), egui::Button::new("🔗").small());
+        let _ = ui.put(cell(52.0), egui::Button::new("🗑").small());
+    };
+
+    // warm on the card, then park the pointer on the first bar button
+    mouse_move(&mut input, CARD.center());
+    for _ in 0..2 {
+        frame(&ctx, input.take(), |ui| draw(ui, &mut hovered, &mut clicked));
+    }
+    mouse_move(&mut input, pos2(bar.min.x + 11.0, bar.center().y));
+    for _ in 0..3 {
+        frame(&ctx, input.take(), |ui| draw(ui, &mut hovered, &mut clicked));
+    }
+    assert!(hovered, "the ✎ button inside the hover bar must sense the pointer");
+    assert!(!clicked, "no click was sent in this test");
+}
+
+#[test]
+fn hover_bar_button_clicks_among_page_interacts() {
+    // mirrors the desk layering: page interact first, then the card (with a
+    // context menu attached), then the hover-bar cells placed with `put`
+    let ctx = Context::default();
+    let mut input = base_input();
+    let bar = bar_rect();
+    let mut clicked = false;
+
+    let draw = |ui: &mut Ui, clicked: &mut bool| {
+        ui.allocate_exact_size(PAGE.size(), Sense::click_and_drag()); // the page below
+        ui.advance_cursor_after_rect(CARD);
+        let resp = ui.interact(CARD, egui::Id::unique(("c", "1")), Sense::click_and_drag());
+        resp.context_menu(|_| {});
+        let bar_hovered = ui.rect_contains_pointer(bar) || ui.rect_contains_pointer(CARD);
+        // a neighbor covering the bar zone, drawn after the card
+        ui.interact(
+            bar.translate(vec2(40.0, 2.0)),
+            egui::Id::unique(("nbr", "1")),
+            Sense::click_and_drag(),
+        );
+        // the hover-bar pass — last, above every prior widget
+        if resp.hovered() || bar_hovered {
+            let cell = Rect::from_min_size(pos2(bar.min.x + 26.0, bar.min.y), vec2(22.0, bar.height()));
+            let r = ui.put(cell, egui::Button::new("🔗").small());
+            *clicked |= r.clicked();
+        }
+    };
+
+    let link_pos = pos2(bar.min.x + 37.0, bar.center().y);
+    mouse_move(&mut input, CARD.center());
+    for _ in 0..2 {
+        frame(&ctx, input.take(), |ui| draw(ui, &mut clicked));
+    }
+    mouse_move(&mut input, link_pos);
+    frame(&ctx, input.take(), |ui| draw(ui, &mut clicked));
+    mouse_down(&mut input, link_pos);
+    frame(&ctx, input.take(), |ui| draw(ui, &mut clicked));
+    mouse_up(&mut input, link_pos);
+    frame(&ctx, input.take(), |ui| draw(ui, &mut clicked));
+    assert!(clicked, "the 🔗 hover-bar cell must receive the click");
+}
+
+#[test]
 fn card_click_works() {
     let ctx = Context::default();
     let mut hud = card_hud();

@@ -130,8 +130,11 @@ pub struct Annotation {
 // Link targets
 // ---------------------------------------------------------------------------
 
+// Adjacent tagging: internally-tagged newtype variants holding a bare
+// string (Annotation / Url) cannot be serialized by serde at all —
+// `{"t": "annotation", "v": "<id>"}` is the stable on-disk and sidecar form.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "t", rename_all = "snake_case")]
+#[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum LinkTarget {
     /// Another annotation, anywhere in the library.
     Annotation(String),
@@ -196,4 +199,33 @@ pub fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod link_target_json_tests {
+    use super::*;
+
+    /// All three variants must survive a JSON round trip — this is the seam
+    /// that silently refused to serialize (internally-tagged newtype of a
+    /// bare string) and made every link insertion fail.
+    #[test]
+    fn link_targets_round_trip_through_json() {
+        for target in [
+            LinkTarget::Annotation("8f7b-ann-id".into()),
+            LinkTarget::Page { book: "book-fp".into(), page: 12 },
+            LinkTarget::Url("https://example.com".into()),
+        ] {
+            let json = serde_json::to_string(&target).expect("serialize LinkTarget");
+            let back: LinkTarget = serde_json::from_str(&json).expect("deserialize LinkTarget");
+            assert_eq!(back, target, "round trip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn link_target_json_is_tagged_and_readable() {
+        let json = serde_json::to_string(&LinkTarget::Annotation("abc".into())).unwrap();
+        assert_eq!(json, r#"{"t":"annotation","v":"abc"}"#);
+        let json = serde_json::to_string(&LinkTarget::Page { book: "fp".into(), page: 3 }).unwrap();
+        assert_eq!(json, r#"{"t":"page","v":{"book":"fp","page":3}}"#);
+    }
 }

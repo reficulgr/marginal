@@ -64,13 +64,114 @@ pub struct Reader {
     armed: Option<ArmMode>,
     editing: Option<EditingNote>,
     link_dialog: Option<LinkDialog>,
-    show_links_panel: bool,
+    /// notes sidebar: every note & marginalia in book order, plus connections
+    show_notes_panel: bool,
+    /// fresh bottom edge of the toolbar — the film anchors below it
+    toolbar_bottom: f32,
     error: Option<String>,
     pub toast_out: Option<String>,
     toast_at: f64,
     /// App-level nav request: (book_id, page) — consumed by App each frame.
     pub pending_jump: Option<(i64, u32)>,
 }
+
+    /// One desk marginalia seen by the margin solver.
+    #[derive(Clone)]
+struct MarginCol {
+        id: String,
+        dot_y: f32,
+        body: String,
+        natural_w: f32,
+        max_w: f32,
+    }
+
+    /// Fit a margin column so chalk boxes never overlap. Remedy one: a box
+    /// that overfills the gap to the next dot below reflows wider into the
+    /// free desk — fewer rows, shorter box, top still pinned at its dot.
+    /// Remedy two: whatever still collides slides down the strip, hanging
+    /// from its dot by its thread. Single-row notes are pins: never
+    /// widened, never moved, never overlapped — the solve stops at them
+    /// and movable notes yield instead. Judged on measured text, fresh
+    /// every frame; the original widths live in the notes and are never
+    /// written back, so the arrangement reverts by itself once the
+    /// crowding goes away.
+    fn solve_margin_boxes(
+        ui: &egui::Ui,
+        content_bottom: f32,
+        mut col: Vec<MarginCol>,
+    ) -> Vec<(String, f32, f32)> {
+        col.sort_by(|a, b| a.dot_y.total_cmp(&b.dot_y));
+        let pad = 4.0f32;
+        let ink = crate::theme::NOTE_CHALK;
+        let n = col.len();
+
+        // remedy one — widen to fit the vertical gap, stepping at row
+        // breaks until the box is short enough (or reaches the one-row
+        // floor, or the live window edge)
+        let mut h = vec![0.0f32; n];
+        let mut w = vec![0.0f32; n];
+        let mut pin = vec![false; n];
+        for i in 0..n {
+            let next_y = if i + 1 < n { col[i + 1].dot_y } else { content_bottom };
+            let gap = (next_y - col[i].dot_y - pad).max(30.0);
+            let g = crate::theme::layout_note(ui, &col[i].body, col[i].natural_w, ink);
+            let mut hh = (g.size().y + 8.0).max(42.0);
+            let mut rows = g.rows.len();
+            let mut ww = col[i].natural_w;
+            if rows > 1 && hh > gap {
+                while ww < col[i].max_w {
+                    ww = (ww + 40.0).min(col[i].max_w);
+                    let g2 = crate::theme::layout_note(ui, &col[i].body, ww, ink);
+                    hh = (g2.size().y + 8.0).max(42.0);
+                    rows = g2.rows.len();
+                    if hh <= gap || rows <= 1 {
+                        break;
+                    }
+                }
+            }
+            h[i] = hh;
+            w[i] = ww;
+            pin[i] = rows <= 1;
+        }
+
+        // the dot of the next single-row pin below — pins bound how far a
+        // movable box may reach downward
+        let mut next_pin_y = vec![f32::INFINITY; n];
+        for i in (0..n).rev() {
+            if pin[i] {
+                next_pin_y[i] = col[i].dot_y;
+            } else if i + 1 < n {
+                next_pin_y[i] = next_pin_y[i + 1];
+            }
+        }
+
+        // remedy two — displacement: walk top to bottom; a movable box
+        // hangs from its dot but slides down when crowded, and if it would
+        // poke the next pin it defers past it instead (the pin refuses)
+        let mut out: Vec<(String, f32, f32)> = Vec::with_capacity(n);
+        let mut cursor = f32::NEG_INFINITY;
+        let mut deferred: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if pin[i] {
+                out.push((col[i].id.clone(), col[i].dot_y, w[i]));
+                cursor = col[i].dot_y + h[i] + pad;
+            } else {
+                let top = col[i].dot_y.max(cursor);
+                if next_pin_y[i] - pad < top + h[i] {
+                    deferred.push(i);
+                } else {
+                    out.push((col[i].id.clone(), top, w[i]));
+                    cursor = top + h[i] + pad;
+                }
+            }
+        }
+        for i in deferred {
+            let top = col[i].dot_y.max(cursor);
+            out.push((col[i].id.clone(), top, w[i]));
+            cursor = top + h[i] + pad;
+        }
+        out
+    }
 
 impl Reader {
     pub fn open(store: SharedStore, book: BookMeta) -> Reader {
@@ -109,7 +210,8 @@ impl Reader {
             armed: None,
             editing: None,
             link_dialog: None,
-            show_links_panel: false,
+            show_notes_panel: false,
+            toolbar_bottom: 0.0,
             error: None,
             toast_out: None,
             toast_at: 0.0,
@@ -366,7 +468,7 @@ impl Reader {
         }
 
         // toolbar
-        egui::Panel::top("reader_toolbar")
+        let toolbar = egui::Panel::top("reader_toolbar")
             .frame(crate::theme::panel_frame())
             .show(ui, |ui| {
             ui.add_space(4.0);
@@ -443,31 +545,31 @@ impl Reader {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button(if self.show_links_panel { "✒ Links ×" } else { "✒ Links" })
+                        .button(if self.show_notes_panel { "🗒 Notes ×" } else { "🗒 Notes" })
+                        .on_hover_text("every note & marginalia, in book order")
                         .clicked()
                     {
-                        self.show_links_panel = !self.show_links_panel;
+                        self.show_notes_panel = !self.show_notes_panel;
                     }
                     ui.label(egui::RichText::new(&self.book.title).weak());
                 });
             });
             ui.add_space(4.0);
         });
+        // fresh every frame: the film anchors below this edge, since the
+        // panel-path layout can hold a stale window size across resizes
+        self.toolbar_bottom = toolbar.response.rect.bottom();
 
-        // links side panel
-        if self.show_links_panel {
-            egui::Panel::right("reader_links")
-                .resizable(true)
-                .default_size(320.0)
-                .frame(crate::theme::panel_frame())
-                .show(ui, |ui| {
-                    self.links_panel(ui);
-                });
-        }
-
-        // canvas
+        // canvas — full width, always; the strip is pinned UI floating
+        // over its right edge. Pages, notes and the dot grid show through
+        // its 20% translucency and pan beneath it like anywhere else —
+        // but the strip's own contents never scroll or drag: it never
+        // moves of its own accord.
         egui::CentralPanel::default().show(ui, |ui| {
             self.canvas(ui);
+            if self.show_notes_panel {
+                self.notes_film(ui);
+            }
         });
     }
 
@@ -479,12 +581,19 @@ impl Reader {
     /// through), ~90% of the available width, ticks every 2% of the page
     /// span (longer every 10%), red position bracket, click / drag-scrub.
     fn page_ruler(&mut self, ui: &mut Ui) {
-        let avail = ui.max_rect();
+        // same escape as the film strip: the ruler paints in its own layer
+        // pinned to the fresh client rect — its clip is fresh every frame,
+        // so nothing stale can drag the map off-screen
+        let avail = ui.ctx().content_rect();
         let w = avail.width() * 0.9;
         let ruler = Rect::from_min_size(
             pos2(avail.left() + (avail.width() - w) * 0.5, avail.bottom() - 32.0),
             vec2(w, 24.0),
         );
+        egui::Area::new(egui::Id::unique("reader-ruler-layer"))
+            .order(egui::Order::Middle)
+            .fixed_pos(pos2(avail.left(), ruler.top()))
+            .show(ui.ctx(), |ui| {
         let ruler_id = egui::Id::unique(("reader-ruler", self.book.id));
         let resp = ui.interact(ruler, ruler_id, Sense::click_and_drag());
         let painter = ui.painter().clone();
@@ -568,6 +677,28 @@ impl Reader {
             );
         }
 
+        // page dots: every page holding a post-it shows the pin's red, and
+        // every page holding marginalia the margin dot's light blue — both
+        // stacked north of the ruler in clear sky. The tallest vertical on
+        // the strip is the 52px chapter spike; the dots start above the
+        // spike tips, so no line can ever reach them, and the red rides
+        // low, blue hovers high, like marginalia floats above its page.
+        let (postit_pages, margin_pages) = ruler_page_marks(&self.annotations);
+        for page_no in &postit_pages {
+            painter.circle_filled(
+                pos2(fx(frac_of(*page_no)), ruler.top() - 35.0),
+                4.5,
+                crate::theme::PIN_RED,
+            );
+        }
+        for page_no in &margin_pages {
+            painter.circle_filled(
+                pos2(fx(frac_of(*page_no)), ruler.top() - 46.0),
+                3.0,
+                crate::theme::MARGIN_BLUE,
+            );
+        }
+
         if resp.clicked() || resp.dragged() {
             if resp.dragged() {
                 self.scrub_until =
@@ -626,6 +757,7 @@ impl Reader {
                 );
             }
         }
+        });
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
@@ -771,6 +903,11 @@ impl Reader {
 
         let clicks_enabled = !pan_now;
 
+        // hover bars render in an overlay pass after the sheets, threads
+        // and ruler — egui hit-testing favors later widgets, so drawing the
+        // bars last guarantees no neighbor can sit on top of them
+        let mut hover_bars: Vec<(Annotation, Rect)> = Vec::new();
+
         // draw each sheet (annotations ride along, per page)
         let mut sheet_data: Vec<(u32, Rect, Vec<Annotation>)> = Vec::new();
         for sheet in &sheets {
@@ -788,11 +925,12 @@ impl Reader {
                 &page_anns,
                 postit_min,
                 clicks_enabled,
+                &mut hover_bars,
             );
             sheet_data.push((sheet.page_no, sheet.rect, page_anns));
         }
 
-        // links across visible sheets
+        // link overlays across visible sheets
         self.draw_link_overlays(ui, &sheet_data);
 
         // link picker dialog
@@ -800,15 +938,28 @@ impl Reader {
             links::show_dialog(ui.ctx(), self.store.clone(), &mut dialog);
             if !dialog.open {
                 if let Some((src, target)) = dialog.result.take() {
-                    crate::store::with_store(&self.store, |s| s.insert_link(&src, &target)).ok();
+                    if let Err(e) = crate::store::with_store(&self.store, |s| {
+                        s.insert_link(&src, &target)
+                    }) {
+                        self.error = Some(format!("could not add the link: {e:#}"));
+                    }
+                } else {
+                    self.link_dialog = Some(dialog);
                 }
-            } else {
-                self.link_dialog = Some(dialog);
             }
         }
 
         // page ruler: floats transparently over the desk, ~90% window width
         self.page_ruler(ui);
+        self.hover_bar_pass(ui, &hover_bars);
+    }
+
+    /// Overlay pass: at most one note hover bar (the bar the pointer nearest
+    /// sits on), drawn after every desk widget so it can never be covered.
+    fn hover_bar_pass(&mut self, ui: &mut Ui, bars: &[(Annotation, Rect)]) {
+        for (ann, rect) in bars {
+            self.note_hover_bar(ui, ann, *rect);
+        }
     }
 
     /// One physical page on the desk: shadow, paper, texture, interaction,
@@ -823,6 +974,7 @@ impl Reader {
         page_anns: &[Annotation],
         postit_min: [f32; 2],
         allow_clicks: bool,
+        bars: &mut Vec<(Annotation, Rect)>,
     ) {
         let Some(tex) = self.ensure_page_texture(ui.ctx(), page_no) else {
             ui.painter().text(
@@ -881,7 +1033,7 @@ impl Reader {
         for ann in page_anns {
             if let Anchor::PostIt { .. } = ann.anchor {
                 let auto = auto_hang.get(&ann.id).copied();
-                self.draw_postit(ui, ann, page_rect, auto);
+                self.draw_postit(ui, ann, page_rect, auto, bars);
             }
         }
 
@@ -901,9 +1053,51 @@ impl Reader {
                     vec2(MARGIN_STRIP_W, page_rect.height()),
                 )
             };
+            // margin solver: chalk boxes may not overlap. Remedy one: an
+            // overfilling box reflows wider into the free desk — fewer
+            // rows, shorter box, top still pinned at its dot. Remedy two:
+            // whatever still collides slides down the strip, hanging from
+            // its dot by its thread. Single-row notes are pins: never
+            // widened, never moved, never overlapped — the solve stops at
+            // them. Measured fresh every frame; the widened shape is
+            // view-layer state, so everything reverts by itself.
+            let mut solved: std::collections::HashMap<String, (f32, f32)> =
+                std::collections::HashMap::new();
+            if has_margin_notes {
+                let content = ui.ctx().content_rect();
+                let cols: Vec<MarginCol> = page_anns
+                    .iter()
+                    .filter_map(|ann| {
+                        let Anchor::Margin { y } = &ann.anchor else { return None };
+                        let natural_w = strip_rect.width() - 12.0;
+                        // room to widen: outward from the page, bounded by
+                        // the live window edge
+                        let max_w = if strip_left {
+                            strip_rect.left() + 4.0 + natural_w - (content.left() + 8.0)
+                        } else {
+                            content.right() - 8.0 - (strip_rect.left() + 4.0)
+                        };
+                        Some(MarginCol {
+                            id: ann.id.clone(),
+                            dot_y: strip_rect.top() + y * page_rect.height(),
+                            body: if ann.body.is_empty() {
+                                "…".to_string()
+                            } else {
+                                ann.body.clone()
+                            },
+                            natural_w,
+                            max_w: max_w.max(natural_w),
+                        })
+                    })
+                    .collect();
+                for (id, top, width) in solve_margin_boxes(ui, content.bottom(), cols) {
+                    solved.insert(id, (top, width));
+                }
+            }
             for ann in page_anns {
                 if let Anchor::Margin { .. } = ann.anchor {
-                    self.draw_margin_note(ui, ann, strip_rect, page_rect);
+                    let place = solved.get(&ann.id).copied();
+                    self.draw_margin_note(ui, ann, strip_rect, page_rect, bars, place);
                 }
             }
         }
@@ -1083,6 +1277,7 @@ impl Reader {
         ann: &Annotation,
         page_rect: Rect,
         auto: Option<[f32; 2]>,
+        bars: &mut Vec<(Annotation, Rect)>,
     ) {
         let Anchor::PostIt {
             x,
@@ -1154,6 +1349,7 @@ impl Reader {
         let pin_rect = Rect::from_center_size(pin_pos, vec2(14.0, 14.0));
         ui.advance_cursor_after_rect(pin_rect);
         let pin_resp = ui.interact(pin_rect, pin_id, Sense::click_and_drag());
+        self.note_context_menu(ann, &pin_resp);
 
         // ----- pencil thread — turns red while this note is being edited -----
         if !card.contains(pin_pos) {
@@ -1182,6 +1378,7 @@ impl Reader {
         let card_id = egui::Id::unique(("postit", ann.id.clone()));
         ui.advance_cursor_after_rect(card);
         let resp = ui.interact(card, card_id, Sense::click_and_drag());
+        self.note_context_menu(ann, &resp);
 
         let grip_id = egui::Id::unique(("postit-grip", ann.id.clone()));
         let grip_rect = Rect::from_center_size(card.right_bottom() - vec2(8.0, 8.0), vec2(18.0, 18.0));
@@ -1218,7 +1415,7 @@ impl Reader {
 
         // hover bar (stays up while the pointer is over the bar itself)
         if editing.is_none() {
-            self.note_hover_bar(ui, ann, card, resp.hovered());
+            bars.push((ann.clone(), card));
         }
 
         // text
@@ -1330,14 +1527,27 @@ impl Reader {
     // Marginalia
     // ==================================================================
 
-    fn draw_margin_note(&mut self, ui: &mut Ui, ann: &Annotation, strip: Rect, page_rect: Rect) {
+    fn draw_margin_note(
+        &mut self,
+        ui: &mut Ui,
+        ann: &Annotation,
+        strip: Rect,
+        page_rect: Rect,
+        bars: &mut Vec<(Annotation, Rect)>,
+        solved: Option<(f32, f32)>, // (box top, wrap width) from the margin solver
+    ) {
         // marginalia = white chalk handwriting floating on the desk.
         // No card. The note's color only shows in the connector + anchor dot.
         let ink = crate::theme::NOTE_CHALK;
         let thread = note_color_ui(&ann.color);
         let Anchor::Margin { y } = ann.anchor else { return };
 
-        let w = strip.width();
+        // the dot never moves; the solver may widen the wrap and slide the
+        // box down the strip when boxes crowd — the thread stays attached
+        let text_w = solved.map(|s| s.1).unwrap_or(strip.width() - 12.0);
+        let box_top = solved
+            .map(|s| s.0)
+            .unwrap_or_else(|| strip.top() + y * page_rect.height());
         let y_screen = strip.top() + y * page_rect.height();
 
         // measure the text so the interaction area fits the handwriting
@@ -1346,9 +1556,16 @@ impl Reader {
         } else {
             ann.body.clone()
         };
-        let probe = crate::theme::layout_note(ui, probe_text.as_str(), w - 12.0, ink);
+        let probe = crate::theme::layout_note(ui, probe_text.as_str(), text_w, ink);
         let h = (probe.size().y + 8.0).max(42.0);
-        let rect = Rect::from_min_size(pos2(strip.left() + 4.0, y_screen), vec2(w - 12.0, h));
+        // widening grows outward from the page: on a left strip the box's
+        // right edge stays put and the box grows leftward
+        let rect = if strip.right() <= page_rect.left() + 1.0 {
+            let right = strip.left() + 4.0 + (strip.width() - 12.0);
+            Rect::from_min_max(pos2(right - text_w, box_top), pos2(right, box_top + h))
+        } else {
+            Rect::from_min_size(pos2(strip.left() + 4.0, box_top), vec2(text_w, h))
+        };
 
         // the anchor dot on the page edge is itself draggable: grabbing it
         // re-targets which passage this marginalia points at
@@ -1431,6 +1648,7 @@ impl Reader {
         let card_id = egui::Id::unique(("margin", ann.id.clone()));
         ui.advance_cursor_after_rect(rect);
         let resp = ui.interact(rect, card_id, Sense::click_and_drag());
+        self.note_context_menu(ann, &resp);
         let r = rect;
 
         if ann.body.trim().is_empty() {
@@ -1447,20 +1665,20 @@ impl Reader {
         }
 
         // hover bar (stays up while the pointer is over the bar itself)
-        self.note_hover_bar(ui, ann, r, resp.hovered());
+            bars.push((ann.clone(), r));
 
         // vertical drag re-anchors the note height (card OR its anchor dot)
         if resp.dragged() {
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
             if let Anchor::Margin { y } = &mut moved.anchor {
-                *y += resp.drag_delta().y / page_rect.height();
+                *y = (*y + resp.drag_delta().y / page_rect.height()).clamp(0.0, 1.0);
             }
             self.save_annotation(moved);
         }
         if dot_resp.dragged() {
             let mut moved = self.fetch_annotation(&ann.id).unwrap_or_else(|| ann.clone());
             if let Anchor::Margin { y } = &mut moved.anchor {
-                *y += dot_resp.drag_delta().y / page_rect.height();
+                *y = (*y + dot_resp.drag_delta().y / page_rect.height()).clamp(0.0, 1.0);
             }
             self.save_annotation(moved);
         }
@@ -1476,47 +1694,128 @@ impl Reader {
     // Shared note UI bits
     // ==================================================================
 
-    fn note_hover_bar(&mut self, ui: &mut Ui, ann: &Annotation, rect: Rect, card_hovered: bool) {
+    /// Duplicate: same ink, color and page on a fresh id and pin spot.
+    /// The card slot is not carried over — it re-hugs the new pin like a
+    /// fresh spawn would, so the copy reads as a new note, not a shadow.
+    fn duplicate_note(&mut self, ann: &Annotation) {
+        let now = now_secs();
+        let mut dup = ann.clone();
+        dup.id = uuid::Uuid::new_v4().to_string();
+        dup.created_at = now;
+        dup.updated_at = now;
+        match &mut dup.anchor {
+            Anchor::PostIt { x, y, card, card_s, .. } => {
+                *x = nudge_frac(*x, 0.035);
+                *y = nudge_frac(*y, 0.035);
+                *card = None; // re-hug: hang beside its own new pin
+                *card_s = None;
+            }
+            Anchor::Margin { y } => {
+                *y = nudge_frac(*y, 0.055);
+            }
+        }
+        crate::store::with_store(&self.store, |s| s.insert_annotation(self.book.id, &dup)).ok();
+        self.annotations.push(dup);
+    }
+
+    /// Delete a note and every link touching it (outgoing and incoming),
+    /// so no orphan connections survive the note.
+    fn delete_note(&mut self, id: &str) {
+        crate::store::with_store(&self.store, |s| {
+            s.delete_annotation(id).ok();
+            for (src, link_id, target) in s.links_of_book(self.book.id).unwrap_or_default() {
+                let points_here = matches!(&target, LinkTarget::Annotation(dst) if dst == id);
+                if src == id || points_here {
+                    s.delete_link(&link_id).ok();
+                }
+            }
+            Ok(())
+        })
+        .ok();
+        self.annotations.retain(|a| a.id != id);
+        if self.editing.as_ref().is_some_and(|e| e.id == id) {
+            self.editing = None;
+        }
+    }
+
+    /// Right-click on any note — desk or sidebar — duplicates or deletes it.
+    fn note_context_menu(&mut self, ann: &Annotation, resp: &egui::Response) {
+        resp.context_menu(|ui| {
+            if ui
+                .button("Duplicate note")
+                .on_hover_text("same ink, fresh pin spot")
+                .clicked()
+            {
+                self.duplicate_note(ann);
+                ui.close();
+                ui.ctx().request_repaint();
+            }
+            if ui
+                .button("Delete note")
+                .on_hover_text("remove the note and its links")
+                .clicked()
+            {
+                self.delete_note(&ann.id);
+                ui.close();
+                ui.ctx().request_repaint();
+            }
+        });
+    }
+
+    fn note_hover_bar(&mut self, ui: &mut Ui, ann: &Annotation, rect: Rect) {
         let bar_y = (rect.min.y - BAR_H - 4.0).max(4.0);
         let bar = Rect::from_min_size(pos2(rect.min.x, bar_y), vec2(rect.width(), BAR_H));
 
-        // keep the bar visible while the pointer is anywhere on card or bar
-        let bar_hovered = ui.rect_contains_pointer(bar) || ui.rect_contains_pointer(rect);
-        if !(card_hovered || bar_hovered) {
+        // the bar shows while the pointer is anywhere on card or bar
+        if !(ui.rect_contains_pointer(bar) || ui.rect_contains_pointer(rect)) {
             return;
         }
-        let bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar).invisible());
-        let mut bar_ui = bar_ui;
-        bar_ui.horizontal(|ui| {
-            if ui.small_button("✎").on_hover_text("edit").clicked() {
-                self.editing = Some(EditingNote {
-                    id: ann.id.clone(),
-                    buf: ann.body.clone(),
-                });
+        // The bar must stay interactive: a child ui built with
+        // UiBuilder::invisible() is disabled in egui 0.37+, so every widget
+        // inside it was dead (hover never registered). Place the buttons
+        // directly at absolute rects instead — same idiom as the page ruler.
+        let cell = |ix: f32| Rect::from_min_size(pos2(bar.min.x + ix, bar.min.y), vec2(22.0, BAR_H));
+        if ui
+            .put(cell(0.0), egui::Button::new("✎").small())
+            .on_hover_text("edit")
+            .clicked()
+        {
+            self.editing = Some(EditingNote {
+                id: ann.id.clone(),
+                buf: ann.body.clone(),
+            });
+        }
+        if ui
+            .put(cell(26.0), egui::Button::new("🔗").small())
+            .on_hover_text("add link")
+            .clicked()
+        {
+            self.link_dialog = Some(links::LinkDialog::new(
+                &ann.id,
+                self.book.fingerprint.clone(),
+                self.page,
+            ));
+        }
+        if ui
+            .put(cell(52.0), egui::Button::new("🗑").small())
+            .on_hover_text("delete")
+            .clicked()
+        {
+            self.delete_note(&ann.id);
+        }
+        let outgoing = crate::store::with_store(&self.store, |s| s.links_for(&ann.id))
+            .unwrap_or_default();
+        // one → per outgoing link (up to three): each jumps to its own
+        // destination — another note, a page, or a URL
+        for (ix, (_, target)) in outgoing.iter().enumerate().take(3) {
+            let tip = format!("jump to {}", links::describe(target));
+            if ui
+                .put(cell(78.0 + 26.0 * ix as f32), egui::Button::new("→").small())
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.navigate_target(target.clone());
             }
-            if ui.small_button("🔗").on_hover_text("add link").clicked() {
-                self.link_dialog = Some(links::LinkDialog::new(
-                    &ann.id,
-                    self.book.fingerprint.clone(),
-                    self.page,
-                ));
-            }
-            if ui.small_button("🗑").on_hover_text("delete").clicked() {
-                crate::store::with_store(&self.store, |s| s.delete_annotation(&ann.id)).ok();
-                self.annotations.retain(|a| a.id != ann.id);
-            }
-        });
-        let n = crate::store::with_store(&self.store, |s| s.links_for(&ann.id))
-            .map(|v| v.len())
-            .unwrap_or(0);
-        if n > 0 {
-            ui.painter().text(
-                pos2(bar.max.x, bar.min.y + BAR_H * 0.5),
-                Align2::RIGHT_CENTER,
-                format!("{n} links"),
-                FontId::proportional(10.0),
-                Color32::from_rgb(90, 90, 90),
-            );
         }
     }
 
@@ -1567,79 +1866,206 @@ impl Reader {
         }
     }
 
-    fn links_panel(&mut self, ui: &mut Ui) {
+    // ==================================================================
+    // Notes index strip
+    // ==================================================================
+
+    /// Sort key: reading order — page, then anchor y (top to bottom),
+    /// then anchor x (left to right). Marginalia has no x; its thread
+    /// anchors the page edge, so it sorts by y alone and reads before the
+    /// post-its of the same height band (the margin hangs beside the text).
+    fn anchor_sort_key(ann: &Annotation) -> (u32, u32, u32) {
+        let page = ann.page;
+        match ann.anchor {
+            Anchor::PostIt { x, y, .. } => (page, (y * 1000.0).round() as u32, (x * 1000.0).round() as u32),
+            Anchor::Margin { y } => (
+                page,
+                (y * 1000.0).round() as u32,
+                0, // margin strip sits beside the page's left edge
+            ),
+        }
+    }
+
+    /// The notes strip as a strip of celluloid film laid ON the desk: the
+    /// workspace keeps running beneath the translucent base, the drop
+    /// shadow is the post-its' own (same offset, same light), so the film
+    /// reads as part of the same pile of desk objects.
+    /// The notes strip: pinned sidebar UI, 20%-transparent Midnight, laid
+    /// over the full-width desk. Pages, notes and the dot grid show
+    /// through the translucency and pan beneath like anywhere else; the
+    /// strip's own contents respond to nothing — no wheel, no drag — so
+    /// the sidebar itself never moves.
+    fn notes_film(&mut self, ui: &mut Ui) {
+        // fresh screen truth: the panel path can hold a stale window size
+        // across resizes; the context always knows the live client, so the
+        // film anchors to it and paints in its own layer, with its own —
+        // fresh, every frame — clip. Nothing stale can drag it off-screen.
+        let avail = ui.ctx().content_rect();
+        let film = Rect::from_min_max(
+            pos2(avail.right() - 294.0, self.toolbar_bottom + 10.0),
+            pos2(avail.right() - 8.0, avail.bottom() - 8.0),
+        );
+        egui::Area::new(egui::Id::unique("notes-film-layer"))
+            .order(egui::Order::Middle)
+            .fixed_pos(film.min)
+            .show(ui.ctx(), |ui| {
+        // the film lies on the desk: clicks and drags on the strip must
+        // not reach paper, ruler or cards underneath
+        let _ = ui.allocate_rect(film, egui::Sense::click_and_drag());
+
+        // soft drop shadow — the post-its' blurred sprite, same offset
+        let shadow = self.ensure_shadow(ui.ctx());
+        let q = film.expand2(vec2(22.0, 22.0));
+        let mut sm = egui::Mesh::default();
+        sm.texture_id = shadow.id();
+        for (pt, uv) in [
+            (q.left_top(), pos2(0.0, 0.0)),
+            (q.right_top(), pos2(1.0, 0.0)),
+            (q.right_bottom(), pos2(1.0, 1.0)),
+            (q.left_bottom(), pos2(0.0, 1.0)),
+        ] {
+            sm.vertices.push(egui::epaint::Vertex {
+                pos: pt + vec2(2.0, 3.5),
+                color: Color32::from_black_alpha(150),
+                uv,
+            });
+        }
+        sm.indices.extend([0u32, 1, 2, 0, 2, 3]);
+        ui.painter().add(egui::Shape::mesh(sm));
+
+        // translucent Midnight base + a wisp of emulsion grain
+        ui.painter().rect_filled(film, 0.0, crate::theme::film_midnight());
+        #[cfg(debug_assertions)]
+        if std::env::var("MARGINAL_FILM_TRACE").as_deref() == Ok("1") {
+            eprintln!(
+                "[film-trace] max={:?} clip={:?} film={:?} pan=({:.0},{:.0}) z={:.2}",
+                ui.max_rect(),
+                ui.painter().clip_rect(),
+                film,
+                self.pan.x,
+                self.pan.y,
+                self.zoom
+            );
+        }
+        let painter = ui.painter().clone();
+        for (tint, alpha) in [([245u8, 235, 220], 10), ([10, 12, 34], 16)] {
+            let grain = self.ensure_grain(ui.ctx(), tint);
+            let ns = 46.0;
+            let mut mesh = egui::Mesh::default();
+            mesh.texture_id = grain.id();
+            for (pt, uv) in [
+                (film.left_top(), pos2(0.0, 0.0)),
+                (film.right_top(), pos2(film.width() / ns, 0.0)),
+                (
+                    film.right_bottom(),
+                    pos2(film.width() / ns, film.height() / ns),
+                ),
+                (film.left_bottom(), pos2(0.0, film.height() / ns)),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: pt,
+                    color: Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], alpha),
+                    uv,
+                });
+            }
+            mesh.indices.extend([0u32, 1, 2, 0, 2, 3]);
+            painter.add(egui::Shape::mesh(mesh));
+        }
+
+                // content, in a sub-ui exactly over the film
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt("notes-film-body")
+                        .max_rect(film.shrink2(vec2(6.0, 6.0))),
+                    |ui| {
+                        self.notes_body(ui);
+                    },
+                );
+            },
+        );
+    }
+
+    /// The strip's contents: every annotation rendered as it appears on
+    /// the desk — post-its as real paper tiles (fixed width), marginalia
+    /// as white chalk handwriting (fixed width) — grouped by page,
+    /// ordered by reading position. Moving pins on the desk re-orders
+    /// the strip.
+    fn notes_body(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
-        ui.heading("Links in this book");
+        ui.heading("Notes in book order");
         ui.add_space(4.0);
 
-        let annotations = self.annotations.clone();
-        let links =
+        let mut anns = self.annotations.clone();
+        anns.sort_by_key(Self::anchor_sort_key);
+
+        // every link of the book, grouped under its source, so the strip can
+        // attach connections directly to the note they belong to
+        let links_by_src = links::group_by_src(
             crate::store::with_store(&self.store, |s| s.links_of_book(self.book.id))
-                .unwrap_or_default();
+                .unwrap_or_default(),
+        );
 
-        ScrollArea::vertical().show(ui, |ui| {
-            egui::CollapsingHeader::new(egui::RichText::new(format!(
-                "Notes ({})",
-                annotations.len()
-            )))
-            .default_open(true)
+        let tile_w = ui.available_width() - 24.0;
+
+        // the strip is immovable UI: its contents never scroll on the
+        // wheel and never drag — only the scrollbar can move the list
+        ScrollArea::vertical()
+            .scroll_source(egui::containers::scroll_area::ScrollSource {
+                scroll_bar: true,
+                drag: egui::containers::scroll_area::DragScroll::Never,
+                mouse_wheel: false,
+            })
             .show(ui, |ui| {
-                let mut nav_to: Option<u32> = None;
-                for ann in &annotations {
-                    let count = links.iter().filter(|(src, _, _)| src == &ann.id).count();
+            let mut last_page: Option<u32> = None;
+            for ann in &anns {
+                // page group headers — a thin amber chapter-rule
+                if last_page != Some(ann.page) {
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        ui.painter().rect_filled(
-                            Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)),
-                            CornerRadius::same(2),
-                            note_color_ui(&ann.color),
+                        ui.label(
+                            egui::RichText::new(format!("p. {}", ann.page))
+                                .strong()
+                                .color(crate::theme::CHAPTER_MARK),
                         );
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let label = format!("p.{:>3} — {}", ann.page, note_preview(&ann.body, 40));
-                        if ui.button(label).on_hover_text("jump to this note's page").clicked() {
-                            nav_to = Some(ann.page);
-                        }
-                        if count > 0 {
-                            ui.weak(format!("↯{count}"));
+                        let label = self
+                            .chapter_marks
+                            .iter()
+                            .filter(|(p, _)| *p == ann.page)
+                            .map(|(_, t)| t.clone())
+                            .next();
+                        if let Some(t) = label {
+                            ui.label(egui::RichText::new(t).weak().small());
                         }
                     });
+                    ui.separator();
+                    last_page = Some(ann.page);
                 }
-                if let Some(p) = nav_to {
-                    self.go_to_page(p);
-                }
-            });
 
-            ui.add_space(8.0);
-            egui::CollapsingHeader::new(egui::RichText::new(format!(
-                "Connections ({})",
-                links.len()
-            )))
-            .default_open(true)
-            .show(ui, |ui| {
-                for (src, link_id, target) in &links {
-                    let src_page = annotations
-                        .iter()
-                        .find(|a| a.id == *src)
-                        .map(|a| a.page)
-                        .unwrap_or(0);
-                    ui.horizontal(|ui| {
-                        ui.label(format!("p.{src_page} {}", links::describe(target)));
-                        if ui.small_button("→").on_hover_text("go").clicked() {
-                            self.navigate_target(target.clone());
-                        }
-                        if ui.small_button("✕").on_hover_text("delete link").clicked() {
-                            crate::store::with_store(&self.store, |s| s.delete_link(link_id)).ok();
-                            ui.ctx().request_repaint();
-                        }
-                    });
+                match ann.anchor {
+                    Anchor::PostIt { .. } => {
+                        self.sidebar_postit(ui, ann, tile_w);
+                    }
+                    Anchor::Margin { .. } => {
+                        self.sidebar_margin(ui, ann, tile_w);
+                    }
                 }
-                if links.is_empty() {
-                    ui.label(egui::RichText::new("No links yet — hover a note, press 🔗.").weak());
+
+                // connections ride with their note — click to jump, ✕ to remove
+                if let Some(rows) = links_by_src.get(&ann.id) {
+                    for (link_id, target) in rows {
+                        self.sidebar_link_row(ui, link_id, target);
+                    }
                 }
-            });
-            ui.add_space(80.0);
+            }
+            if anns.is_empty() {
+                ui.label(
+                    egui::RichText::new("No notes yet — arm 📌 or 🗒 and click the page.").weak(),
+                );
+            }
+            ui.add_space(24.0);
         });
 
-        // footer: sidecar buttons
+        // footer: sidecar buttons (moved over from the links panel)
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1685,13 +2111,137 @@ impl Reader {
         });
     }
 
+    /// One sidebar post-it: the same paper tile code path as the desk,
+    /// width pinned to the strip (height flows from the ink).
+    fn sidebar_postit(&mut self, ui: &mut Ui, ann: &Annotation, tile_w: f32) {
+        let pad = crate::theme::NOTE_PAD;
+        let w = tile_w.max(60.0);
+        let text_w = w - 2.0 * pad;
+
+        let card_fill = paler(note_color_parts(&ann.color), 0.22);
+        let grain = self.ensure_grain(ui.ctx(), card_fill);
+        let shadow = self.ensure_shadow(ui.ctx());
+        let painter = ui.painter().clone();
+
+        // height from the ink, exactly like the desk resolves it
+        let ink_h = if ann.body.trim().is_empty() {
+            2.0 * pad + crate::theme::note_font().size * 2.0
+        } else {
+            crate::theme::layout_note(ui, ann.body.as_str(), text_w, Color32::TRANSPARENT)
+                .size()
+                .y
+                + 2.0 * pad
+        };
+        let h = ink_h.max(46.0);
+
+        let (rect, _resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+        let card = rect.intersect(rect.expand(0.0)); // full row = card
+
+        paint_paper(&painter, card, egui::util::hash(ann.id.clone()), card_fill, &grain, &shadow, false);
+
+        // text (wobble keeps the hand-placed feel, as on the desk)
+        if ann.body.trim().is_empty() {
+            painter.text(
+                card.center(),
+                Align2::CENTER_CENTER,
+                "empty note",
+                FontId::proportional(11.0),
+                Color32::from_rgb(120, 120, 120),
+            );
+        } else {
+            let g = crate::theme::layout_note(ui, ann.body.as_str(), text_w, Color32::from_rgb(40, 40, 40));
+            let wob = vec2(
+                (egui::util::hash((ann.id.clone(), "ix")) % 7) as f32 - 3.0,
+                (egui::util::hash((ann.id.clone(), "iy")) % 7) as f32 - 3.0,
+            );
+            painter.galley(
+                card.min + vec2(pad, pad) + wob,
+                g,
+                Color32::from_rgb(40, 40, 40),
+            );
+        }
+
+        // red pin dot, top-left, so the row announces itself as a post-it
+        painter.circle_filled(pos2(card.left() + pad * 0.55, card.top() + pad * 0.55), 4.0, crate::theme::PIN_RED);
+
+        // click → jump to the note's page
+        let resp = ui.interact(
+            rect,
+            egui::Id::unique(("sidebar-postit", ann.id.clone())),
+            Sense::click(),
+        );
+        self.note_context_menu(ann, &resp);
+        if resp.clicked() {
+            self.go_to_page(ann.page);
+        }
+    }
+
+    /// One connection row under a sidebar note: where the link goes —
+    /// click jumps (even across books / to URLs), ✕ removes just the link.
+    fn sidebar_link_row(&mut self, ui: &mut Ui, link_id: &str, target: &LinkTarget) {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let label = egui::RichText::new(links::describe(target)).weak();
+            if ui
+                .button(label)
+                .on_hover_text("go to the linked entity")
+                .clicked()
+            {
+                self.navigate_target(target.clone());
+            }
+            if ui
+                .small_button("✕")
+                .on_hover_text("remove this link")
+                .clicked()
+            {
+                crate::store::with_store(&self.store, |s| s.delete_link(link_id)).ok();
+                ui.ctx().request_repaint();
+            }
+        });
+    }
+
+    /// One sidebar marginalia: white chalk handwriting on the panel,
+    /// fixed to strip width — same face and ink as on the desk.
+    fn sidebar_margin(&mut self, ui: &mut Ui, ann: &Annotation, tile_w: f32) {
+        let chalk = crate::theme::NOTE_CHALK;
+        let w = tile_w.max(60.0);
+        let ink_h = if ann.body.trim().is_empty() {
+            42.0
+        } else {
+            crate::theme::layout_note(ui, ann.body.as_str(), w - 12.0, chalk)
+                .size()
+                .y
+                + 8.0
+        };
+        let h = ink_h.max(42.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+
+        let g = crate::theme::layout_note(ui, ann.body.as_str(), w - 12.0, chalk);
+        ui.painter().galley(rect.min + vec2(6.0, 4.0), g, chalk);
+
+        // the colored anchor dot hints the thread color on the desk
+        ui.painter()
+            .circle_filled(pos2(rect.left() + 2.0, rect.top() + 8.0), 3.0, note_color_ui(&ann.color));
+
+        let resp = ui.interact(
+            rect,
+            egui::Id::unique(("sidebar-margin", ann.id.clone())),
+            Sense::click(),
+        );
+        self.note_context_menu(ann, &resp);
+        if resp.clicked() {
+            self.go_to_page(ann.page);
+        }
+    }
+
     fn reload_annotations(&mut self) {
         self.annotations =
             crate::store::with_store(&self.store, |s| s.annotations_for_book(self.book.id))
                 .unwrap_or_default();
     }
 
-    fn navigate_target(&mut self, target: LinkTarget) {        match target {
+    fn navigate_target(&mut self, target: LinkTarget) {
+        match target {
             LinkTarget::Page { book, page } => {
                 if book == self.book.fingerprint {
                     self.go_to_page(page);
@@ -1737,7 +2287,12 @@ impl Reader {
 /// Stacking along a horizontal margin (top/bottom hangs): slide sideways
 /// past neighbors, clamped to stay above/below the page's width.
 fn stack_along_v(x_pin: f32, stack: &mut Vec<f32>, w_frac: f32) -> f32 {
-    let mut x_c = (x_pin - w_frac * 0.45).clamp(-0.08, 1.08 - w_frac);
+    // clamp bounds can invert when the card is wider than the page
+    // (w_frac > 1.16) — sort them so the clamp never panics.
+    // NB: bound goes through a named var; `-0.08_f32.min(..)` would parse
+    // as -(0.08_f32.min(..)) since unary minus binds looser than methods.
+    let t = 1.08_f32 - w_frac;
+    let mut x_c = (x_pin - w_frac * 0.45).clamp(t.min(-0.08), t.max(-0.08));
     for _ in 0..40 {
         if !stack.iter().any(|&ox| (ox - x_c).abs() < w_frac + 0.014) {
             break;
@@ -1752,7 +2307,10 @@ fn stack_along_v(x_pin: f32, stack: &mut Vec<f32>, w_frac: f32) -> f32 {
 /// Stacking along a vertical margin (left/right hangs): slide downward
 /// past neighbors.
 fn stack_along_h(y_pin: f32, stack: &mut Vec<f32>, h_frac: f32) -> f32 {
-    let mut y_c = (y_pin - h_frac * 0.4).clamp(-0.16, 1.1 - h_frac);
+    // clamp bounds can invert when the card is taller than the page —
+    // same ordering guard as stack_along_v (see its comment)
+    let t = 1.1_f32 - h_frac;
+    let mut y_c = (y_pin - h_frac * 0.4).clamp(t.min(-0.16), t.max(-0.16));
     for _ in 0..40 {
         if !stack.iter().any(|&oy| (oy - y_c).abs() < h_frac + 0.012) {
             break;
@@ -1768,6 +2326,62 @@ fn stack_along_h(y_pin: f32, stack: &mut Vec<f32>, h_frac: f32) -> f32 {
 fn hash01(v: u64) -> f32 {
     let x = egui::util::hash(v);
     ((x >> 11) as f64 / (1u64 << 53) as f64) as f32
+}
+
+/// Nudge a 0..1 anchor fraction; wraps toward the inside at the edge, so a
+/// duplicate lands beside the original instead of stacking at a clamp.
+fn nudge_frac(v: f32, d: f32) -> f32 {
+    let nv = v + d;
+    if nv > 0.97 { (v - d).max(0.0) } else { nv }
+}
+
+/// Pages holding at least one post-it, and pages holding at least one
+/// marginalium — sorted, one entry per page; drives the ruler's page dots.
+fn ruler_page_marks(anns: &[Annotation]) -> (Vec<u32>, Vec<u32>) {
+    let mut reds = std::collections::BTreeSet::new();
+    let mut blues = std::collections::BTreeSet::new();
+    for ann in anns {
+        match ann.anchor {
+            Anchor::PostIt { .. } => {
+                reds.insert(ann.page);
+            }
+            Anchor::Margin { .. } => {
+                blues.insert(ann.page);
+            }
+        }
+    }
+    (reds.into_iter().collect(), blues.into_iter().collect())
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    /// Oversized cards (wider/taller than the page) must not panic the
+    /// clamps — regression for the launch crash (f32 clamp min > max).
+    #[test]
+    fn stack_along_tolerates_oversized_cards() {
+        for frac in [1.16_f32, 1.55, 2.0, 3.0] {
+            let mut s = Vec::new();
+            let x = stack_along_v(0.5, &mut s, frac);
+            assert!(x.is_finite());
+            let mut s = Vec::new();
+            let y = stack_along_h(0.5, &mut s, frac);
+            assert!(y.is_finite());
+            let _ = (x, y);
+        }
+        // stacked neighbors with oversized cards too — one stack per axis,
+        // mirroring how compute_auto_hangs keeps separate top/bottom and
+        // left/right stacks
+        let mut sv = Vec::new();
+        let mut sh = Vec::new();
+        for _ in 0..40 {
+            let _ = stack_along_v(0.9, &mut sv, 2.5);
+            let _ = stack_along_h(0.1, &mut sh, 2.5);
+        }
+        assert_eq!(sv.len(), 40);
+        assert_eq!(sh.len(), 40);
+    }
 }
 
 fn tinted(c: [u8; 3], factor: f32) -> Color32 {
@@ -1882,15 +2496,6 @@ pub fn border_color_ui(name: &str) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-fn note_preview(body: &str, max: usize) -> String {
-    let one = body.lines().collect::<Vec<_>>().join(" ");
-    if one.chars().count() <= max {
-        one
-    } else {
-        one.chars().take(max).collect::<String>() + "…"
-    }
-}
-
 fn card_focus(ann: &Annotation, page_rect: Rect) -> Pos2 {
     match ann.anchor {
         Anchor::PostIt { x, y, .. } => pos2(
@@ -1924,4 +2529,118 @@ fn edge_point_toward(rect: Rect, from: Pos2) -> Pos2 {
         }
     }
     from + seg * hi
+}
+
+#[cfg(test)]
+mod ruler_marks_tests {
+    use super::*;
+
+    fn ann(page: u32, margin: bool) -> Annotation {
+        Annotation {
+            id: uuid::Uuid::new_v4().to_string(),
+            page,
+            anchor: if margin {
+                Anchor::Margin { y: 0.5 }
+            } else {
+                Anchor::PostIt { x: 0.5, y: 0.5, card: None, card_s: None, size: None }
+            },
+            body: String::new(),
+            color: "yellow".into(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// The ruler shows one dot per page, not per note — a page with three
+    /// post-its and a marginalium contributes exactly one red and one blue.
+    #[test]
+    fn ruler_marks_dedupe_by_page_and_kind() {
+        let anns = vec![ann(6, false), ann(6, false), ann(6, true), ann(7, true)];
+        let (reds, blues) = ruler_page_marks(&anns);
+        assert_eq!(reds, vec![6]);
+        assert_eq!(blues, vec![6, 7]);
+        let (reds, blues) = ruler_page_marks(&[]);
+        assert!(reds.is_empty() && blues.is_empty(), "empty book, empty ruler");
+    }
+}
+
+#[cfg(test)]
+mod margin_solve_tests {
+    use super::*;
+
+    fn run(cols: &[MarginCol]) -> Vec<(String, f32, f32)> {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(900.0, 700.0)));
+        let mut out = Vec::new();
+        let mut full = ctx.run_ui(raw, |ui| {
+            out = solve_margin_boxes(ui, 700.0, cols.to_vec());
+        });
+        full.textures_delta.clear(); // test pass: no renderer consumes fonts
+        out
+    }
+
+    fn col(id: &str, dot_y: f32, body: &str, natural_w: f32, max_w: f32) -> MarginCol {
+        MarginCol {
+            id: id.into(),
+            dot_y,
+            body: body.into(),
+            natural_w,
+            max_w,
+        }
+    }
+
+    fn find(out: &[(String, f32, f32)], id: &str) -> (f32, f32) {
+        let (_, t, w) = out.iter().find(|(i, _, _)| i == id).unwrap();
+        (*t, *w)
+    }
+
+    #[test]
+    fn a_crowded_marginalia_widens_into_its_gap() {
+        // ~44 chars: two rows at the natural 238px wrap, one row when wide
+        let body = "alpha beta gamma delta epsilon zeta eta theta";
+        let out = run(&vec![
+            col("a", 100.0, &body, 238.0, 460.0),
+            col("b", 140.0, "single", 238.0, 460.0),
+        ]);
+        let (ta, wa) = find(&out, "a");
+        let (tb, _) = find(&out, "b");
+        assert!(wa > 238.0, "clashing box widens (got {}px)", wa);
+        assert_eq!(ta, 100.0, "top stays pinned at the dot");
+        assert_eq!(tb, 140.0, "the pin sits at its dot, unmoved");
+    }
+
+    #[test]
+    fn single_line_pins_refuse_and_the_movable_note_defers_past_them() {
+        // long body: many rows even at the widened width cap, so remedy
+        // one is exhausted and the note must give way to the pin
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi "
+            .repeat(2);
+        let out = run(&vec![
+            col("a", 0.0, &body, 90.0, 120.0),
+            col("b", 40.0, "hi", 238.0, 460.0),
+        ]);
+        let (ta, _) = find(&out, "a");
+        let (tb, _) = find(&out, "b");
+        assert_eq!(tb, 40.0, "the pin refuses to move");
+        assert!(
+            ta >= 40.0 + 42.0 + 4.0,
+            "the movable note defers below the pin, clear of it (got {})",
+            ta
+        );
+    }
+
+    #[test]
+    fn uncrowded_columns_keep_original_widths() {
+        let out = run(&vec![
+            col("a", 0.0, "hello world", 238.0, 460.0),
+            col("b", 300.0, "another note", 238.0, 460.0),
+        ]);
+        let (ta, wa) = find(&out, "a");
+        let (tb, wb) = find(&out, "b");
+        assert_eq!(wa, 238.0, "no pressure, no widening");
+        assert_eq!(wb, 238.0);
+        assert_eq!(ta, 0.0);
+        assert_eq!(tb, 300.0);
+    }
 }

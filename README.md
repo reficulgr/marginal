@@ -14,10 +14,28 @@ that lives *around* the text:
   resizable with a 15-characters × 7-lines floor.
 - **Marginalia** — white chalk handwriting (Rock Salt) floating beside the
   page, its dashed thread crossing the sheet to underline the exact passage.
-  The anchor dot is draggable to re-target.
+  The anchor dot is draggable to re-target. The margin is a solved column:
+  when notes would overlap (deep zoom-out), a clashing note reflows wider
+  into the free desk — fewer rows, shorter box, top still pinned at its
+  dot — and whatever still collides slides down the strip, hanging from
+  its dot by its thread. Single-row notes are pins: never widened, never
+  moved, never overlapped — the solve stops at them. Judged on measured
+  text every frame from the notes' original widths (never written back),
+  so the arrangement reverts by itself as the crowding goes away.
 - **Hyperlinks** — link any note to another note, any page of any book (by
   content fingerprint, so links survive file moves), or an external URL.
   Hand-drawn dashed threads, drawn across spreads when both notes are open.
+  In the notes strip each connection is listed right under its note — click
+  it to jump (across books too; URLs open in the browser), ✕ to remove just
+  the link. The desk hover bar grows one `→` per link to jump from there.
+- **The notes strip** — fixed sidebar UI: 20%-transparent Midnight laid
+  over the full-width desk. Pages, notes and the dot grid show through
+  the translucency and pan beneath it like anywhere else, but the strip's
+  own contents respond to nothing — no wheel, no content drag, only the
+  scrollbar — so the sidebar itself never moves. Soft drop shadow and a
+  wisp of emulsion grain. Every annotation renders as it appears on the
+  desk — paper tiles, chalk handwriting — grouped by page, in reading
+  order, connections listed directly under their note.
 - **Book view** — facing pages with a binding gutter: left = even, right =
   odd, title page alone on the right. ◀ ▶ flip spread by spread. Marginalia
   hangs on the outer margins; the spine stays clean. Single-view and
@@ -25,9 +43,13 @@ that lives *around* the text:
 - **The ruler** — a transparent strip floating over the desk: tick marks
   every 2% of the page span, chapter skeleton in amber (from the PDF's
   embedded outline), a red hairline marker for your position, click /
-  drag-to-scrub navigation, and `p.N · Chapter` hover previews.
+  drag-to-scrub navigation, and `p.N · Chapter` hover previews. Pages that
+  hold a post-it show the pin's exact red on the baseline; pages with
+  marginalia float the margin dot's light blue just above it — one dot per
+  page, so the ruler reads as a census of where the notes live.
 - **Pannable desk** — hold space (or middle-drag) to move everything around;
   ctrl+wheel zooms; the wheel pans.
+- **Notes index strip** — every post-it and marginalia in one right-hand panel, ordered by where they sit in the book (page, then reading position). Post-its render as the same paper tiles as on the desk, marginalia as the same chalk; click any entry to jump to its page. New pins land in the strip in book order. Right-click any note — on the desk or in the strip — to duplicate it (same ink, fresh pin spot) or delete it (its links go with it).
 - **Sidecars** — export any book's annotation layer to `<book>.marginal.json`
   next to the book file and re-import it elsewhere. Books are never modified;
   annotations live in an overlay.

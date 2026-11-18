@@ -22,6 +22,16 @@ pub const CONNECTOR: Color32 = Color32::from_rgb(43, 46, 51);
 pub const CHAPTER_MARK: Color32 = Color32::from_rgb(226, 186, 110);
 /// Post-it pins are always red.
 pub const PIN_RED: Color32 = Color32::from_rgb(226, 72, 72);
+
+/// Marginalia's identity shade — the margin anchor dot's light "blue" —
+/// reused for the ruler's page-has-marginalia dot.
+pub const MARGIN_BLUE: Color32 = Color32::from_rgb(167, 213, 245);
+/// The notes strip: #0e011a at 20% transparency — pinned sidebar UI.
+/// Pages, notes and desk show through; the strip's own contents respond
+/// to nothing (no wheel, no drag — scrollbar only), so it never moves.
+pub fn film_midnight() -> Color32 {
+    Color32::from_rgba_unmultiplied(14, 1, 26, 204)
+}
 /// Faint dashed thread between a post-it pin and its card (pencil, quite transparent).
 pub fn postit_thread() -> Color32 {
     Color32::from_rgba_unmultiplied(43, 46, 51, 95)
