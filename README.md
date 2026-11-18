@@ -22,6 +22,13 @@ that lives *around* the text:
   moved, never overlapped — the solve stops at them. Judged on measured
   text every frame from the notes' original widths (never written back),
   so the arrangement reverts by itself as the crowding goes away.
+- **Installing** — `cargo run` is the dev loop; to keep Marginal, run
+  `pkgbuild/install.sh`: it builds the release binary and installs it with
+  a launcher entry and icon into `~/.local` (binary on your PATH at
+  `~/.local/bin/marginal`, opens from the app launcher). A system-wide
+  `makepkg` install uses the same files staged into `pkgbuild/src/`. Fonts
+  are compiled in and state lives in `~/.local/share/marginal`, so the
+  binary is portable.
 - **Hyperlinks** — link any note to another note, any page of any book (by
   content fingerprint, so links survive file moves), or an external URL.
   Hand-drawn dashed threads, drawn across spreads when both notes are open.

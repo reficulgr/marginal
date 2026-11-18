@@ -1,0 +1,23 @@
+# PKGBUILD for Marginal — builds from this working tree and installs the
+# binary, desktop entry and icon system-wide (`makepkg -fsi`).
+pkgname=marginal
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Read PDFs and pin notes in their margins"
+arch=('any')
+url="https://github.com/reficulgr/marginal"
+license=('MIT')
+depends=('glibc' 'gcc-libs') # pdfium + fonts are embedded/bundled at build
+makedepends=('cargo')
+
+build() {
+  cd "${srcdir}"
+  cargo build --release
+}
+
+package() {
+  cd "${srcdir}"
+  install -Dm755 marginal "$pkgdir/usr/bin/marginal"
+  install -Dm644 marginal.desktop "$pkgdir/usr/share/applications/marginal.desktop"
+  install -Dm644 marginal.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/marginal.svg"
+}

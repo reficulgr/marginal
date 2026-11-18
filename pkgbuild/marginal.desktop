@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Marginal
+GenericName=Book annotation
+Comment=Read PDFs and pin notes in their margins
+Exec=marginal
+TryExec=marginal
+Icon=marginal
+Terminal=false
+Categories=Office;Graphics;Viewer;Utility;
+Keywords=pdf;reader;annotation;post-it;marginalia;notes;
+StartupWMClass=marginal
