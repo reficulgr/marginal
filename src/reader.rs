@@ -844,7 +844,23 @@ impl Reader {
         if !editing_active && zd == 1.0 {
             let wheel = ui.input(|i| i.smooth_scroll_delta());
             if wheel != Vec2::ZERO {
-                self.pan += wheel;
+                // the pointer over the open strip belongs to the strip:
+                // its own ScrollArea consumes the scroll (and scrolls the
+                // notes), so the desk must not pan from the same event.
+                // (raw pointer test: ui.rect_contains_pointer would check
+                // the PANEL's layer, and the pointer rests on the film's
+                // Middle layer instead — it is never "contained".)
+                let film = self.notes_film_rect(ui.ctx().content_rect());
+                let over_strip = self.show_notes_panel
+                    && ui.input(|i| {
+                        i.pointer
+                            .latest_pos()
+                            .map(|p| film.contains(p))
+                            .unwrap_or(false)
+                    });
+                if !over_strip {
+                    self.pan += wheel;
+                }
             }
         }
         if !editing_active && (space_down || middle_down) {
@@ -2337,17 +2353,22 @@ impl Reader {
     /// over the full-width desk. Pages, notes and the dot grid show
     /// through the translucency and pan beneath like anywhere else; the
     /// strip's own contents respond to nothing — no wheel, no drag — so
-    /// the sidebar itself never moves.
+    /// the sidebar itself never moves — except that wheel-over-strip now
+    /// scrolls the strip (the desk politely skips those events).
+    fn notes_film_rect(&self, avail: Rect) -> Rect {
+        Rect::from_min_max(
+            pos2(avail.right() - 294.0, self.toolbar_bottom + 10.0),
+            pos2(avail.right() - 8.0, avail.bottom() - 8.0),
+        )
+    }
+
     fn notes_film(&mut self, ui: &mut Ui) {
         // fresh screen truth: the panel path can hold a stale window size
         // across resizes; the context always knows the live client, so the
         // film anchors to it and paints in its own layer, with its own —
         // fresh, every frame — clip. Nothing stale can drag it off-screen.
         let avail = ui.ctx().content_rect();
-        let film = Rect::from_min_max(
-            pos2(avail.right() - 294.0, self.toolbar_bottom + 10.0),
-            pos2(avail.right() - 8.0, avail.bottom() - 8.0),
-        );
+        let film = self.notes_film_rect(avail);
         egui::Area::new(egui::Id::unique("notes-film-layer"))
             .order(egui::Order::Middle)
             .fixed_pos(film.min)
@@ -2450,13 +2471,14 @@ impl Reader {
 
         let tile_w = ui.available_width() - 24.0;
 
-        // the strip is immovable UI: its contents never scroll on the
-        // wheel and never drag — only the scrollbar can move the list
+        // the strip scrolls on the wheel while the pointer rides it
+        // (hovering the strip is the strip's business, not the desk's);
+        // content drags stay dead — only the scrollbar and the wheel move it
         ScrollArea::vertical()
             .scroll_source(egui::containers::scroll_area::ScrollSource {
                 scroll_bar: true,
                 drag: egui::containers::scroll_area::DragScroll::Never,
-                mouse_wheel: false,
+                mouse_wheel: true,
             })
             .show(ui, |ui| {
             // bookmarks first: the pages you tagged, tabs lying flat, tips

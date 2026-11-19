@@ -44,8 +44,13 @@ fn main() {
         println!();
         println!("Usage:");
         println!("  marginal                     run the graphical app");
+        println!("  marginal --version           print the version");
         println!("  marginal --scan <dir>        headless: index a folder, print results");
         println!("  marginal --render <pdf> <page> <out.png>  headless render one page");
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("marginal {}", env!("CARGO_PKG_VERSION"));
         return;
     }
 

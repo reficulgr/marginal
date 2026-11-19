@@ -22,6 +22,20 @@ that lives *around* the text:
   moved, never overlapped — the solve stops at them. Judged on measured
   text every frame from the notes' original widths (never written back),
   so the arrangement reverts by itself as the crowding goes away.
+- **Bookmark tabs** — bookmark stickers on the page's top edge: a frosted
+  slip with a colored tip poking past the edge (the part a closed book
+  shows), its Rock Salt title reading up the spine. A tab never takes a
+  chosen spot — it hangs at its page's *address*, the page's exact
+  percentage along the edge, the same station its pennant uses on the
+  ruler; the far ends nudge inward just enough to stay on paper. A second
+  tab on the same page hugs the first with a tiny gap. Every page that is
+  not on screen contributes just its tip over the edge — the closed
+  book's skyline, split at the spine in book view (previous pages over
+  the left sheet, future over the right). Hovering a tip confesses its
+  name vertically in white chalk; clicking it jumps to the page. In the
+  notes strip the tabs lie flat, title upright, like the post-its they
+  share a painter with; double-click retypes one in place. There is no
+  drag: peel and re-stick.
 - **Installing** — `cargo run` is the dev loop; to keep Marginal, run
   `pkgbuild/install.sh`: it builds the release binary and installs it with
   a launcher entry and icon into `~/.local` (binary on your PATH at
@@ -37,12 +51,12 @@ that lives *around* the text:
   the link. The desk hover bar grows one `→` per link to jump from there.
 - **The notes strip** — fixed sidebar UI: 20%-transparent Midnight laid
   over the full-width desk. Pages, notes and the dot grid show through
-  the translucency and pan beneath it like anywhere else, but the strip's
-  own contents respond to nothing — no wheel, no content drag, only the
-  scrollbar — so the sidebar itself never moves. Soft drop shadow and a
-  wisp of emulsion grain. Every annotation renders as it appears on the
-  desk — paper tiles, chalk handwriting — grouped by page, in reading
-  order, connections listed directly under their note.
+  the translucency and pan beneath it like anywhere else. Content drag
+  stays dead; the scrollbar and the wheel move the strip while the
+  pointer rides it (the wheel anywhere else pans the desk). Soft drop
+  shadow and a wisp of emulsion grain. Every annotation renders as it
+  appears on the desk — paper tiles, chalk handwriting — grouped by
+  page, in reading order, connections listed directly under their note.
 - **Book view** — facing pages with a binding gutter: left = even, right =
   odd, title page alone on the right. ◀ ▶ flip spread by spread. Marginalia
   hangs on the outer margins; the spine stays clean. Single-view and
