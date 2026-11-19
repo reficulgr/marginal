@@ -37,6 +37,8 @@ pub struct PageTex {
     pub tex: egui::TextureHandle,
     /// pixel width it was rendered at (for the quality ladder upgrade)
     pub quality: u32,
+    /// last frame the desk showed this texture — the eviction key
+    pub last_used: std::time::Instant,
 }
 
 pub struct Reader {
@@ -1076,8 +1078,24 @@ impl Reader {
         bars: &mut Vec<(Annotation, Rect)>,
         skyline: &[u32],
     ) {
-        let Some(tex) = self.ensure_page_texture(ui.ctx(), page_no) else {
-            // a cold page: the paper is here, the pixels are on the way
+        let tex = self.ensure_page_texture(ui.ctx(), page_no);
+        if let Some(tex) = &tex {
+            ui.painter().rect_filled(
+                page_rect.translate(vec2(6.0, 8.0)),
+                CornerRadius::same(2),
+                Color32::from_black_alpha(90),
+            );
+            ui.painter().rect_filled(page_rect, CornerRadius::same(2), Color32::WHITE);
+            ui.painter().image(
+                tex.id(),
+                page_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            // a cold page: the paper is here, the pixels are on the way.
+            // The page stays interactive — placement must not be eaten by
+            // the frames where its pixels are still rendering.
             ui.painter().rect_filled(
                 page_rect.translate(vec2(6.0, 8.0)),
                 CornerRadius::same(2),
@@ -1091,21 +1109,7 @@ impl Reader {
                 FontId::proportional(20.0),
                 Color32::from_rgb(120, 120, 120),
             );
-            return;
-        };
-
-        ui.painter().rect_filled(
-            page_rect.translate(vec2(6.0, 8.0)),
-            CornerRadius::same(2),
-            Color32::from_black_alpha(90),
-        );
-        ui.painter().rect_filled(page_rect, CornerRadius::same(2), Color32::WHITE);
-        ui.painter().image(
-            tex.id(),
-            page_rect,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        }
 
         // page interaction: armed hint + creation (space-pan suppresses clicks)
         let page_id = egui::Id::unique(("reader-page", self.book.id, page_no));
@@ -1233,15 +1237,15 @@ impl Reader {
             .min(2000.0) as u32;
         let target_q = if scrub_recent { full_q.min(520) } else { full_q };
 
-        if let Some(t) = self.page_tex_cache.get(&page_no) {
+        if let Some(t) = self.page_tex_cache.get_mut(&page_no) {
+            t.last_used = now;
             if t.quality >= target_q {
                 return Some(t.tex.clone());
             }
-        }
-        // a cached (preview) page shows now while its upgrade is asked
-        if let Some(t) = self.page_tex_cache.get(&page_no).cloned() {
+            // a cached (preview) page shows now while its upgrade is asked
+            let tex = t.tex.clone();
             self.request_render(page_no, target_q);
-            return Some(t.tex);
+            return Some(tex);
         }
         // cold page: ask the worker, show paper until it answers
         self.request_render(page_no, target_q);
@@ -1665,15 +1669,28 @@ impl Reader {
                         color,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.page_tex_cache
-                        .insert(page, PageTex { tex, quality });
+                    self.page_tex_cache.insert(
+                        page,
+                        PageTex {
+                            tex,
+                            quality,
+                            last_used: std::time::Instant::now(),
+                        },
+                    );
                     self.render_pending.remove(&page);
+                    // Evict the least-recently-*shown* page: the desk touches
+                    // every visible sheet each frame, so a page on screen can
+                    // never be the victim. The old pick — the first key in the
+                    // map's internal order — was arbitrary and could evict one
+                    // of the two sheets in view, which then fell back to the
+                    // blank placeholder while re-rendering: the ping-pong that
+                    // read as flicker.
                     while self.page_tex_cache.len() > 6 {
                         let Some(victim) = self
                             .page_tex_cache
-                            .keys()
-                            .find(|k| **k != page)
-                            .copied()
+                            .iter()
+                            .min_by_key(|(_, t)| t.last_used)
+                            .map(|(k, _)| *k)
                         else { break };
                         self.page_tex_cache.remove(&victim);
                     }
