@@ -33,6 +33,11 @@ pub struct MarginalApp {
     scan_rx: Option<Receiver<ScanMsg>>,
     status: ScanStatus,
     errors_pending: Vec<String>,
+    // frame-time probe (MARGINAL_FRAME_TRACE=1): rolling avg + worst, so
+    // perf questions get answered on a stopwatch, not by vibes
+    frame_acc_us: u64,
+    frame_cnt: u32,
+    frame_worst_us: u64,
 }
 
 impl MarginalApp {
@@ -80,6 +85,9 @@ impl MarginalApp {
             scan_rx: None,
             status: ScanStatus::Idle,
             errors_pending: Vec::new(),
+            frame_acc_us: 0,
+            frame_cnt: 0,
+            frame_worst_us: 0,
         })
     }
 
@@ -127,6 +135,11 @@ impl eframe::App for MarginalApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // frame-time probe: measure THIS pass's actual work (not the idle
+        // gap since the last pass!); ~90 passes per print. Every ~90 frames
+        // print the rolling average and the worst pass, plus ppp (the
+        // page-quality ladder keys off it)
+        let probe_start = std::time::Instant::now();
         self.poll_scan(ui.ctx());
 
         match self.mode {
@@ -184,6 +197,26 @@ impl eframe::App for MarginalApp {
                     self.reader = None;
                     self.mode = Mode::Library;
                 }
+            }
+        }
+
+        // probe bookkeeping (see the start of this fn)
+        if std::env::var("MARGINAL_FRAME_TRACE").as_deref() == Ok("1") {
+            let us = probe_start.elapsed().as_micros() as u64;
+            self.frame_acc_us += us;
+            self.frame_cnt += 1;
+            self.frame_worst_us = self.frame_worst_us.max(us);
+            if self.frame_cnt >= 60 {
+                eprintln!(
+                    "[frame-trace] {} avg={:.2}ms worst={:.2}ms ppp={:.3}",
+                    if cfg!(debug_assertions) { "debug" } else { "release" },
+                    self.frame_acc_us as f64 / self.frame_cnt as f64 / 1000.0,
+                    self.frame_worst_us as f64 / 1000.0,
+                    ui.ctx().pixels_per_point()
+                );
+                self.frame_acc_us = 0;
+                self.frame_cnt = 0;
+                self.frame_worst_us = 0;
             }
         }
     }
