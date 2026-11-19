@@ -194,6 +194,44 @@ pub fn darker_parts(c: [u8; 3], factor: f32) -> [u8; 3] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Bookmark tabs: frosted slip with a colorful tip, sticking on the page's
+// top edge. The label runs along the tab; the tip is what a closed book
+// shows.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct Flag {
+    pub id: String,
+    pub page: u32, // 1-based
+    /// 0..1 along the page width — the tab's centre
+    pub x: f32,
+    /// a FLAG_COLORS name (the tip)
+    pub color: String,
+    /// written along the tab; blank = untouched sticker
+    pub label: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+/// Saturated flag-pack colors — deeper than the note pastels so the tips
+/// carry the color story while the body stays frosted.
+pub const FLAG_COLORS: [(&str, [u8; 3]); 6] = [
+    ("red", [232, 74, 74]),
+    ("orange", [245, 145, 55]),
+    ("yellow", [242, 200, 56]),
+    ("green", [86, 182, 111]),
+    ("blue", [70, 150, 225]),
+    ("pink", [232, 110, 180]),
+];
+
+pub fn flag_rgb(name: &str) -> [u8; 3] {
+    FLAG_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(FLAG_COLORS[0].1)
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

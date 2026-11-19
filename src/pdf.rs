@@ -13,6 +13,114 @@ use crate::store::data_dir;
 static INIT: Once = Once::new();
 static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
 
+// ===========================================================================
+// Off-thread rendering: the UI thread never rasterizes. One worker per
+// open book owns a pdfium handle on its own thread (handles don't cross
+// threads), answers render jobs sequentially, and reports the document's
+// metadata once, immediately after opening. Dropping the job sender ends
+// the worker.
+// ===========================================================================
+
+/// All pdfium rasterizing shares one lock — the C API is globally
+/// single-threaded, so the scan's thumbnails and a render worker must
+/// never rasterize at the same instant.
+pub static RENDER_MUX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The metadata the reader needs from a document.
+#[derive(Debug, Clone)]
+pub struct DocInfo {
+    pub page_count: u32,
+    /// (1-based page, title); top-level outline entries only
+    pub outline: Vec<(u32, String)>,
+    /// page sizes in PDF points, 0-based index
+    pub sizes: Vec<(f32, f32)>,
+}
+
+impl OpenDoc {
+    /// Metadata in one pass: page count, outline, and every page's size.
+    pub fn info(&self) -> Result<DocInfo> {
+        let sizes = (0..self.page_count())
+            .map(|i| self.page_size(i))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DocInfo {
+            page_count: self.page_count(),
+            outline: self.outline(),
+            sizes,
+        })
+    }
+}
+
+pub struct RenderJob {
+    pub page: u32, // 1-based
+    pub quality: u32,
+}
+
+#[derive(Debug)]
+pub enum RenderResult {
+    /// sent once, immediately after the worker opens the document
+    Meta(DocInfo),
+    Image {
+        page: u32,
+        quality: u32,
+        img: PageImage,
+    },
+    Failed {
+        page: u32,
+        /// true when the book file itself would not open
+        open_failed: bool,
+    },
+}
+
+/// Spawn the render worker for one book. Owns its document handle for the
+/// thread's lifetime; answers jobs in arrival order.
+pub fn spawn_render_worker(
+    path: PathBuf,
+) -> (
+    std::sync::mpsc::Sender<RenderJob>,
+    std::sync::mpsc::Receiver<RenderResult>,
+) {
+    use std::sync::mpsc;
+    let (job_tx, job_rx) = mpsc::channel::<RenderJob>();
+    let (done_tx, done_rx) = mpsc::channel::<RenderResult>();
+    let _ = std::thread::Builder::new()
+        .name("marginal-render".into())
+        .spawn(move || {
+            let mut doc: Option<OpenDoc> = None;
+            while let Ok(job) = job_rx.recv() {
+                if doc.is_none() {
+                    doc = OpenDoc::open(&path).ok();
+                    let meta = doc.as_ref().and_then(|d| d.info().ok());
+                    let _ = done_tx.send(match meta {
+                        Some(m) => RenderResult::Meta(m),
+                        None => RenderResult::Failed {
+                            page: 0,
+                            open_failed: true,
+                        },
+                    });
+                    if doc.is_none() {
+                        continue; // the book is broken; later jobs drop
+                    }
+                }
+                let page = job.page.saturating_sub(1);
+                let result = doc
+                    .as_ref()
+                    .unwrap()
+                    .render(page, job.quality)
+                    .map(|img| RenderResult::Image {
+                        page: job.page,
+                        quality: job.quality,
+                        img,
+                    })
+                    .unwrap_or(RenderResult::Failed {
+                        page: job.page,
+                        open_failed: false,
+                    });
+                let _ = done_tx.send(result);
+            }
+        });
+    (job_tx, done_rx)
+}
+
 fn candidate_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(p) = std::env::var("MARGINAL_PDFIUM_LIB")
@@ -114,7 +222,10 @@ impl OpenDoc {
     }
 
     /// Render one page (0-based) at the given pixel width, keeping aspect.
+    /// Serialized across every thread that rasterizes (pdfium's C API is
+    /// globally single-threaded).
     pub fn render(&self, page_index: u32, width_px: u32) -> Result<PageImage> {
+        let _g = RENDER_MUX.lock();
         let (w_pts, h_pts) = self.page_size(page_index)?;
         if w_pts <= 0.0 || h_pts <= 0.0 {
             bail!("page {} has zero size", page_index + 1);

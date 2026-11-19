@@ -6,13 +6,15 @@
 //! with a connector line drawn to their anchor point on the page edge.
 
 use egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, ScrollArea, Sense, Stroke,
-    Ui, Vec2,
+    pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, ScrollArea, Sense, Shape,
+    Stroke, Ui, Vec2,
 };
+use egui::emath::Rot2;
+use egui::epaint::TextShape;
 
 use crate::links::{self, LinkDialog};
 use crate::model::*;
-use crate::pdf::{OpenDoc, PageImage};
+use crate::pdf::{DocInfo, RenderJob, RenderResult, spawn_render_worker};
 use crate::store::SharedStore;
 
 const MARGIN_STRIP_W: f32 = 250.0;
@@ -22,6 +24,7 @@ const BAR_H: f32 = 18.0;
 pub enum ArmMode {
     PostIt,
     Margin,
+    Flag,
 }
 
 pub struct EditingNote {
@@ -29,6 +32,7 @@ pub struct EditingNote {
     pub buf: String,
 }
 
+#[derive(Clone)]
 pub struct PageTex {
     pub tex: egui::TextureHandle,
     /// pixel width it was rendered at (for the quality ladder upgrade)
@@ -38,7 +42,7 @@ pub struct PageTex {
 pub struct Reader {
     pub store: SharedStore,
     pub book: BookMeta,
-    pub doc: Option<OpenDoc>,
+    pub doc_info: Option<DocInfo>,
     pub page: u32, // 1-based
     pub page_count: u32,
     pub zoom: f32,
@@ -60,10 +64,22 @@ pub struct Reader {
     /// chapter marks from the pdf outline: (1-based page, title)
     chapter_marks: Vec<(u32, String)>,
 
+    /// pages with a render job in flight, and the quality asked
+    render_pending: std::collections::HashMap<u32, u32>,
+    /// pages the worker could not render — never re-asked
+    render_failed: std::collections::HashSet<u32>,
+    /// the render worker channel (pdfium lives entirely off the UI thread)
+    render_tx: Option<std::sync::mpsc::Sender<RenderJob>>,
+    render_rx: Option<std::sync::mpsc::Receiver<RenderResult>>,
+
     /// armed "click on page to add" mode
     armed: Option<ArmMode>,
     editing: Option<EditingNote>,
     link_dialog: Option<LinkDialog>,
+    /// bookmark tabs stuck on the pages' top edges (frosted slip, colored tip)
+    flags: Vec<Flag>,
+    /// last tip color picked — a real pack: you keep peeling the same flag
+    last_flag_color: String,
     /// notes sidebar: every note & marginalia in book order, plus connections
     show_notes_panel: bool,
     /// fresh bottom edge of the toolbar — the film anchors below it
@@ -175,11 +191,14 @@ struct MarginCol {
 
 impl Reader {
     pub fn open(store: SharedStore, book: BookMeta) -> Reader {
-        let doc = OpenDoc::open(std::path::Path::new(&book.path)).ok();
-        let page_count = doc.as_ref().map(|d| d.page_count()).unwrap_or(1).max(1);
-        let chapter_marks: Vec<(u32, String)> =
-            doc.as_ref().map(|d| d.outline()).unwrap_or_default();
+        // rendering happens entirely off the UI thread: one worker per book
+        // owns the pdfium handle; the UI paints cached pixels only
+        let (render_tx, render_rx) = spawn_render_worker(std::path::PathBuf::from(&book.path));
+        // seed the page count from the library scan until the worker reports
+        let page_count = book.page_count.unwrap_or(1).max(1);
         let annotations = crate::store::with_store(&store, |s| s.annotations_for_book(book.id))
+            .unwrap_or_default();
+        let flags = crate::store::with_store(&store, |s| s.flags_for_book(book.id))
             .unwrap_or_default();
         crate::store::with_store(&store, |s| s.touch_opened(book.id)).ok();
         // book-view preference
@@ -195,21 +214,27 @@ impl Reader {
             facing: facing_pref,
             store,
             book,
-            doc,
             page: 1,
             page_count,
             zoom: 1.0,
             page_tex_cache: Default::default(),
+            doc_info: None,
             annotations,
             pan: Vec2::ZERO,
             last_page_jump: None,
             scrub_until: None,
             grain: Default::default(),
             shadow: None,
-            chapter_marks,
+            chapter_marks: Vec::new(),
+            render_pending: Default::default(),
+            render_failed: Default::default(),
+            render_tx: Some(render_tx),
+            render_rx: Some(render_rx),
             armed: None,
             editing: None,
             link_dialog: None,
+            flags,
+            last_flag_color: "red".into(),
             show_notes_panel: false,
             toolbar_bottom: 0.0,
             error: None,
@@ -452,6 +477,9 @@ impl Reader {
     // ==================================================================
 
     pub fn show(&mut self, ui: &mut Ui, on_back: &mut dyn FnMut()) {
+        // swap in page textures the render worker finished off-thread
+        self.poll_renders(ui.ctx());
+
         // error toast (bottom strip)
         if let Some(err) = self.error.clone() {
             egui::Panel::bottom("reader_error")
@@ -540,6 +568,21 @@ impl Reader {
                         None
                     } else {
                         Some(ArmMode::Margin)
+                    };
+                }
+                if ui
+                    .button(if self.armed == Some(ArmMode::Flag) {
+                        "🔖 click page…"
+                    } else {
+                        "🔖 Tab"
+                    })
+                    .on_hover_text("bookmark tab: sticks on a page's top edge, tip over the edge")
+                    .clicked()
+                {
+                    self.armed = if self.armed == Some(ArmMode::Flag) {
+                        None
+                    } else {
+                        Some(ArmMode::Flag)
                     };
                 }
 
@@ -699,6 +742,20 @@ impl Reader {
             );
         }
 
+        // bookmark tabs: small colored squares, north of the marginalia
+        // circles — the closed-book skyline as tiny tiles, one per flagged
+        // page, in its first-planted tab's color
+        for (page_no, rgb) in ruler_flag_pages(&self.flags) {
+            painter.rect_filled(
+                Rect::from_center_size(
+                    pos2(fx(frac_of(page_no)), ruler.top() - 56.0),
+                    vec2(7.0, 7.0),
+                ),
+                CornerRadius::same(1),
+                Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+            );
+        }
+
         if resp.clicked() || resp.dragged() {
             if resp.dragged() {
                 self.scrub_until =
@@ -798,15 +855,23 @@ impl Reader {
             });
         }
 
-        // keyboard page nav
-        let (pgup, pgdn, home, end) = ui.input(|i| {
-            (
-                i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft),
-                i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight),
-                i.key_pressed(Key::Home),
-                i.key_pressed(Key::End),
-            )
-        });
+        // keyboard page nav — NOT while an inline editor is open: the
+        // caret's arrows, Home/End and paging belong to the words you're
+        // typing. A stray arrow mid-typing would flip the page, arm the
+        // quality ladder, and stall the UI thread on a re-render — frozen
+        // keystrokes, then the repeat queue flushing as a burst.
+        let (pgup, pgdn, home, end) = if editing_active {
+            (false, false, false, false)
+        } else {
+            ui.input(|i| {
+                (
+                    i.key_pressed(Key::PageUp) || i.key_pressed(Key::ArrowLeft),
+                    i.key_pressed(Key::PageDown) || i.key_pressed(Key::ArrowRight),
+                    i.key_pressed(Key::Home),
+                    i.key_pressed(Key::End),
+                )
+            })
+        };
         let step = if self.facing { 2 } else { 1 };
         if pgup {
             self.page = self.page.saturating_sub(step).max(1);
@@ -826,10 +891,9 @@ impl Reader {
         // page geometry from the anchor page (pages share the fit); in book
         // view we also budget the two outer margins so they stay on screen
         let page_pts = self
-            .doc
+            .doc_info
             .as_ref()
-            .map(|d| d.page_size(self.page.saturating_sub(1)))
-            .unwrap_or(Ok((595.0, 842.0)))
+            .and_then(|d| d.sizes.get(self.page.saturating_sub(1) as usize).copied())
             .unwrap_or((595.0, 842.0));
         let avail_h = ui.available_height() - 24.0;
         let scale_h = (avail_h / page_pts.1).max(0.05) * self.zoom;
@@ -908,9 +972,27 @@ impl Reader {
         // bars last guarantees no neighbor can sit on top of them
         let mut hover_bars: Vec<(Annotation, Rect)> = Vec::new();
 
-        // draw each sheet (annotations ride along, per page)
+        // bookmark census: every tabbed page, in book order
+        let tabbed: Vec<u32> = {
+            let set: std::collections::BTreeSet<u32> =
+                self.flags.iter().map(|f| f.page).collect();
+            set.into_iter().collect()
+        };
+
+        // draw each sheet (annotations ride along, per page). The sky
+        // splits at the spine: a book view's left sheet carries the tips
+        // of previous pages, the right sheet the future's; single view's
+        // one sheet shows the whole sky but its own page's tabs.
+        let visible: Vec<u32> = sheets.iter().map(|s| s.page_no).collect();
         let mut sheet_data: Vec<(u32, Rect, Vec<Annotation>)> = Vec::new();
         for sheet in &sheets {
+            let skyline: Vec<u32> = if visible.len() <= 1 {
+                tabbed.iter().copied().filter(|p| *p != sheet.page_no).collect()
+            } else if sheet.strip_left {
+                tabbed.iter().copied().filter(|p| *p < sheet.page_no).collect()
+            } else {
+                tabbed.iter().copied().filter(|p| *p > sheet.page_no).collect()
+            };
             let page_anns: Vec<Annotation> = self
                 .annotations
                 .iter()
@@ -926,6 +1008,7 @@ impl Reader {
                 postit_min,
                 clicks_enabled,
                 &mut hover_bars,
+                &skyline,
             );
             sheet_data.push((sheet.page_no, sheet.rect, page_anns));
         }
@@ -975,8 +1058,16 @@ impl Reader {
         postit_min: [f32; 2],
         allow_clicks: bool,
         bars: &mut Vec<(Annotation, Rect)>,
+        skyline: &[u32],
     ) {
         let Some(tex) = self.ensure_page_texture(ui.ctx(), page_no) else {
+            // a cold page: the paper is here, the pixels are on the way
+            ui.painter().rect_filled(
+                page_rect.translate(vec2(6.0, 8.0)),
+                CornerRadius::same(2),
+                Color32::from_black_alpha(90),
+            );
+            ui.painter().rect_filled(page_rect, CornerRadius::same(2), Color32::from_rgb(232, 230, 223));
             ui.painter().text(
                 page_rect.center(),
                 Align2::CENTER_CENTER,
@@ -1010,6 +1101,7 @@ impl Reader {
                 let hint = match self.armed {
                     Some(ArmMode::PostIt) => "📌 pin here",
                     Some(ArmMode::Margin) => "🗒 place here",
+                    Some(ArmMode::Flag) => "🔖 stick here",
                     None => "",
                 };
                 ui.painter().text(
@@ -1036,7 +1128,6 @@ impl Reader {
                 self.draw_postit(ui, ann, page_rect, auto, bars);
             }
         }
-
         // marginalia: chalk in the outer margin of the spread
         let has_margin_notes = page_anns
             .iter()
@@ -1101,11 +1192,17 @@ impl Reader {
                 }
             }
         }
+
+        // bookmark tabs: frosted slips with colored tips hanging on the
+        // page's top edge (drawn after the notes; they ride the same pass)
+        self.draw_flags(ui, page_no, page_rect, skyline);
     }
 
     fn ensure_page_texture(&mut self, ctx: &egui::Context, page_no: u32) -> Option<egui::TextureHandle> {
-        // quality ladder: while scrubbing (or just after a jump) render a
-        // cheap preview; upgrade to full quality once things settle
+        // the ladder lives in ASKING, not rendering: the UI thread never
+        // rasterizes. Whatever is cached shows right away (a preview after
+        // a fast scrub, full pixels after a settle); a cold page shows
+        // blank paper until the worker answers, usually within a beat.
         let now = std::time::Instant::now();
         let scrub_recent = self
             .scrub_until
@@ -1124,45 +1221,15 @@ impl Reader {
             if t.quality >= target_q {
                 return Some(t.tex.clone());
             }
-            if scrub_recent && t.quality >= 400 {
-                return Some(t.tex.clone()); // good enough mid-scrub
-            }
-            // else: fall through and re-render — the settle upgrade
         }
-        let doc = self.doc.as_ref()?;
-        let quality = target_q;
-        let img: PageImage = match doc.render((page_no - 1) as u32, quality) {
-            Ok(img) => img,
-            Err(e) => {
-                self.error = Some(format!("render failed: {e}"));
-                return None;
-            }
-        };
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [img.width as usize, img.height as usize],
-            &img.rgba,
-        );
-        let tex = ctx.load_texture(
-            format!("marginal-page-{}-{}", self.book.id, page_no),
-            color,
-            egui::TextureOptions::LINEAR,
-        );
-        self.page_tex_cache
-            .insert(page_no, PageTex { tex: tex.clone(), quality });
-        while self.page_tex_cache.len() > 6 {
-            let victim = self
-                .page_tex_cache
-                .keys()
-                .find(|k| **k != page_no)
-                .copied();
-            match victim {
-                Some(k) => {
-                    self.page_tex_cache.remove(&k);
-                }
-                None => break,
-            }
+        // a cached (preview) page shows now while its upgrade is asked
+        if let Some(t) = self.page_tex_cache.get(&page_no).cloned() {
+            self.request_render(page_no, target_q);
+            return Some(t.tex);
         }
-        Some(tex)
+        // cold page: ask the worker, show paper until it answers
+        self.request_render(page_no, target_q);
+        None
     }
 
     /// Blurred shadow sprite: radial gaussian alpha, tinted at draw time.
@@ -1232,6 +1299,41 @@ impl Reader {
         let nx = ((p.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0);
         let ny = ((p.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0);
         let now = now_secs();
+
+        // a tab doesn't take a chosen spot: it takes its page's address —
+        // the page's precise percentage along the top edge, the same math
+        // as the ruler. A second tab on the same page hugs the first,
+        // stepping right with a tiny gap (an exceptional spot that still
+        // vaguely signifies the page's station), and the far ends nudge
+        // themselves inward just enough to stay fully on the sheet.
+        if mode == ArmMode::Flag {
+            let now = now_secs();
+            let cw = tab_ribbon_w(page_rect.width());
+            let k = self.flags.iter().filter(|f| f.page == page_no).count();
+            let x = flag_station_x(page_no, self.page_count, page_rect.width(), cw, k);
+            let flag = Flag {
+                id: uuid::Uuid::new_v4().to_string(),
+                page: page_no,
+                x,
+                color: self.last_flag_color.clone(),
+                label: String::new(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::with_store(&self.store, |s| s.insert_flag(self.book.id, &flag)).ok();
+            // spawn straight into in-place editing, exactly like a fresh post-it
+            self.editing = Some(EditingNote {
+                id: flag.id.clone(),
+                buf: String::new(),
+            });
+            self.flags.push(flag);
+            // the strip reads in book order — keep the vec there after
+            // every in-session mutation (stable sort keeps sibling order)
+            self.flags.sort_by_key(|f| f.page);
+            self.armed = None;
+            return;
+        }
+
         let (anchor, default_color) = match mode {
             ArmMode::PostIt => (
                 Anchor::PostIt {
@@ -1244,6 +1346,8 @@ impl Reader {
                 "yellow",
             ),
             ArmMode::Margin => (Anchor::Margin { y: ny }, "blue"),
+            // tabs already returned above
+            ArmMode::Flag => unreachable!("flag placement returns early"),
         };
         let ann = Annotation {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1262,6 +1366,339 @@ impl Reader {
             id: ann.id,
             buf: String::new(),
         });
+    }
+
+    // ==================================================================
+    // Bookmark tabs
+    // ==================================================================
+
+    /// Bookmark tabs for one sheet. A tab never takes a chosen spot: its
+    /// primary sits at the page's address — the page's precise percentage
+    /// along the top edge, the same math as the ruler — with siblings
+    /// hugging right in tiny steps; the far ends nudge inward just enough
+    /// to stay on the sheet. There is no drag: a tab never moves; peel
+    /// (delete) and re-stick instead. `skyline` lists the non-visible
+    /// pages whose tabs contribute only their tip over this edge (in book
+    /// view the left sheet gets previous pages, the right gets future's);
+    /// hovering a tip confesses the name vertically in white chalk.
+    fn draw_flags(&mut self, ui: &mut Ui, page_no: u32, page_rect: Rect, skyline: &[u32]) {
+        let inert = self.armed.is_none();
+        let count = self.page_count.max(1);
+        let cw = tab_ribbon_w(page_rect.width());
+        let body = tab_body_len(page_rect.height());
+        let tip = tab_tip_len(body);
+        let edge = page_rect.top();
+        let ink = |sz: f32| {
+            FontId::new(
+                sz,
+                egui::FontFamily::Name(crate::theme::NOTE_FONT_FAMILY.into()),
+            )
+        };
+
+        // the sky: other pages' tabs, tip-only, at their stations
+        for sky_page in skyline {
+            let mut tabs: Vec<Flag> = self
+                .flags
+                .iter()
+                .filter(|f| f.page == *sky_page)
+                .cloned()
+                .collect();
+            tabs.sort_by_key(|f| f.created_at);
+            for (k, flag) in tabs.iter().enumerate() {
+                let xc = page_rect.left()
+                    + flag_station_x(*sky_page, count, page_rect.width(), cw, k)
+                        * page_rect.width();
+                let tilt = (str_hash01(&flag.id) * 2.0 - 1.0) * 0.038;
+                let rgb = crate::model::flag_rgb(&flag.color);
+                paint_tab_tip(ui, rgb, pos2(xc, edge), cw, tip, tilt, false);
+                if flag.label.trim().is_empty() {
+                    continue; // a blank tab has nothing to say
+                }
+                let hb = Rect::from_min_max(
+                    pos2(xc - cw * 0.5 - 3.0, edge - tip - 3.0),
+                    pos2(xc + cw * 0.5 + 3.0, edge + 3.0),
+                );
+                let hid = egui::Id::unique(("flag-tip", self.book.id, flag.id.clone()));
+                let resp = ui
+                    .interact(hb, hid, egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.hovered() {
+                    // the name rises from the tip's far edge — north of the
+                    // colored tongue, not from the page edge — white chalk
+                    let font = ink((body * 0.16).clamp(8.5, 13.0));
+                    let g = ui.painter().layout_no_wrap(
+                        flag.label.trim().to_owned(),
+                        font.clone(),
+                        crate::theme::NOTE_CHALK,
+                    );
+                    let h = g.size().x;
+                    paint_text_rotated(
+                        ui,
+                        pos2(xc, edge - tip - 2.0 - h * 0.5),
+                        -std::f32::consts::FRAC_PI_2,
+                        flag.label.trim(),
+                        font,
+                        f32::MAX,
+                        crate::theme::NOTE_CHALK,
+                    );
+                }
+                // a tip is a call button: touching it opens that page
+                if resp.clicked() && inert {
+                    self.go_to_page(*sky_page);
+                }
+            }
+        }
+
+        // bodies: this sheet's own tabs; the primary at the address, the
+        // rest hugging right
+        let mut mine: Vec<Flag> = self
+            .flags
+            .iter()
+            .filter(|f| f.page == page_no)
+            .cloned()
+            .collect();
+        mine.sort_by_key(|f| f.created_at);
+        for (k, flag) in mine.iter().enumerate() {
+            let xc = page_rect.left()
+                + flag_station_x(page_no, count, page_rect.width(), cw, k) * page_rect.width();
+            let pivot = pos2(xc, edge);
+            // a tab being written on straightens, and its vertical ink makes
+            // way for the inline editor's words
+            let editing_this = self
+                .editing
+                .as_ref()
+                .map(|e| e.id == flag.id)
+                .unwrap_or(false);
+            let tilt = if editing_this {
+                0.0
+            } else {
+                (str_hash01(&flag.id) * 2.0 - 1.0) * 0.038
+            };
+            paint_tab(ui, flag, pivot, cw, body, tip, tilt, false, editing_this, -std::f32::consts::FRAC_PI_2);
+
+            // ---- in-place editing, the same way as marginalia & post-its ----
+            if editing_this {
+                let editing = self.editing.take().unwrap();
+                let edit_rect = Rect::from_min_size(
+                    pos2(xc + cw * 0.5 + 6.0, edge + 4.0),
+                    vec2(150.0, 26.0),
+                );
+                // only a ghost outline marks the editing area
+                ui.painter().rect_stroke(
+                    edit_rect,
+                    CornerRadius::same(3),
+                    Stroke::new(1.0, Color32::from_white_alpha(45)),
+                    egui::StrokeKind::Middle,
+                );
+                let ink = Color32::from_rgb(64, 66, 72);
+                let mut buf = editing.buf.clone();
+                let mut layouter =
+                    |ui: &Ui, text: &dyn egui::TextBuffer, width: f32| -> std::sync::Arc<egui::Galley> {
+                        crate::theme::layout_note(ui, text.as_str(), width, ink)
+                    };
+                let edit_id = egui::Id::unique(("edit-tab", editing.id.clone()));
+                let te = egui::TextEdit::singleline(&mut buf)
+                    .desired_width(edit_rect.width())
+                    .frame(egui::Frame::NONE)
+                    .layouter(&mut layouter)
+                    .id(edit_id);
+                let resp = ui.put(edit_rect, te);
+                ui.memory_mut(|m| m.request_focus(edit_id));
+                // tab labels are Latin scratch — drop the platform IME for
+                // this editor so keys bypass fcitx5 and its per-keystroke
+                // protocol round-trips (note bodies keep the full IME)
+                ui.output_mut(|o| o.ime = None);
+                ui.painter().text(
+                    pos2(edit_rect.left(), edit_rect.bottom() + 12.0),
+                    Align2::LEFT_TOP,
+                    "Esc or click away to save",
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(140, 140, 145),
+                );
+                if editor_should_commit(ui, &resp, edit_rect) {
+                    self.save_flag_label(&flag.id, &buf);
+                } else {
+                    self.editing = Some(EditingNote {
+                        id: editing.id,
+                        buf,
+                    });
+                }
+                continue;
+            }
+
+            // hit box: axis-aligned around the tilted tab
+            let bb = Rect::from_min_max(
+                pos2(xc - cw * 0.5 - 4.0, edge - tip - 4.0),
+                pos2(xc + cw * 0.5 + 4.0, edge + body + 4.0),
+            );
+            let fid = egui::Id::unique(("flag-tab", self.book.id, flag.id.clone()));
+            let resp = ui.interact(bb, fid, egui::Sense::click());
+            if !inert {
+                continue;
+            }
+            // a blank tab asks to be written on; double-click retypes a
+            // named one, exactly like the notes' inline editing
+            if resp.double_clicked() {
+                self.editing = Some(EditingNote {
+                    id: flag.id.clone(),
+                    buf: flag.label.clone(),
+                });
+            } else if resp.clicked() && flag.label.trim().is_empty() {
+                self.editing = Some(EditingNote {
+                    id: flag.id.clone(),
+                    buf: flag.label.clone(),
+                });
+            }
+            resp.context_menu(|menu| {
+                let mut picked: Option<String> = None;
+                menu.horizontal(|row| {
+                    row.weak("tip:");
+                    for (name, rgb) in crate::model::FLAG_COLORS {
+                        if row
+                            .button(
+                                egui::RichText::new("■")
+                                    .color(Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(name.to_string());
+                        }
+                    }
+                });
+                if let Some(name) = picked {
+                    self.set_flag_color(&flag.id, &name);
+                    menu.close();
+                }
+                if menu.button("Rename tab").clicked() {
+                    self.editing = Some(EditingNote {
+                        id: flag.id.clone(),
+                        buf: flag.label.clone(),
+                    });
+                    menu.close();
+                }
+                if menu.button("Delete tab").clicked() {
+                    self.delete_flag(&flag.id);
+                    menu.close();
+                }
+            });
+        }
+    }
+
+    fn set_flag_color(&mut self, id: &str, color: &str) {
+        self.last_flag_color = color.to_owned();
+        let Some(f) = self.flags.iter_mut().find(|f| f.id == id) else { return };
+        f.color = color.to_owned();
+        f.updated_at = now_secs();
+        let (page, x, label) = (f.page, f.x, f.label.clone());
+        crate::store::with_store(&self.store, |s| {
+            s.update_flag(id, page, x, color, &label, now_secs())
+        })
+        .ok();
+    }
+
+    fn save_flag_label(&mut self, id: &str, label: &str) {
+        let label = label.trim().to_string();
+        let Some(f) = self.flags.iter_mut().find(|f| f.id == id) else { return };
+        f.label = label.clone();
+        f.updated_at = now_secs();
+        let (page, x, color) = (f.page, f.x, f.color.clone());
+        crate::store::with_store(&self.store, |s| {
+            s.update_flag(id, page, x, &color, &label, now_secs())
+        })
+        .ok();
+    }
+
+    fn delete_flag(&mut self, id: &str) {
+        crate::store::with_store(&self.store, |s| s.delete_flag(id)).ok();
+        self.flags.retain(|f| f.id != id);
+        if self.editing.as_ref().map(|e| e.id.as_str()) == Some(id) {
+            self.editing = None;
+        }
+    }
+
+    // ==================================================================
+    // Render worker plumbing
+    // ==================================================================
+
+    /// Drain finished render results: swap textures in, adopt the book's
+    /// metadata (page count, outline, page sizes) the first time it lands,
+    /// and surface one error if the book itself won't open.
+    fn poll_renders(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.render_rx else { return };
+        let mut repaint = false;
+        loop {
+            let Ok(result) = rx.try_recv() else { break };
+            repaint = true;
+            match result {
+                RenderResult::Meta(meta) => {
+                    self.page_count = meta.page_count.max(1);
+                    self.chapter_marks = meta.outline.clone();
+                    self.doc_info = Some(meta);
+                    crate::store::with_store(&self.store, |s| {
+                        s.set_page_count(self.book.id, self.page_count)
+                    })
+                    .ok();
+                }
+                RenderResult::Image { page, quality, img } => {
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [img.width as usize, img.height as usize],
+                        &img.rgba,
+                    );
+                    let tex = ctx.load_texture(
+                        format!("marginal-page-{}-{}", self.book.id, page),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.page_tex_cache
+                        .insert(page, PageTex { tex, quality });
+                    self.render_pending.remove(&page);
+                    while self.page_tex_cache.len() > 6 {
+                        let Some(victim) = self
+                            .page_tex_cache
+                            .keys()
+                            .find(|k| **k != page)
+                            .copied()
+                        else { break };
+                        self.page_tex_cache.remove(&victim);
+                    }
+                }
+                RenderResult::Failed { page, open_failed } => {
+                    self.render_pending.remove(&page);
+                    if open_failed {
+                        if self.error.is_none() {
+                            self.error =
+                                Some("could not open the book file".into());
+                        }
+                    } else {
+                        self.render_failed.insert(page);
+                        if self.error.is_none() {
+                            self.error = Some(format!("could not render page {page}"));
+                        }
+                    }
+                }
+            }
+        }
+        if repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Ask the worker for `page` at `quality`, deduped: an in-flight job at
+    /// equal or higher quality is never re-sent, and failed pages are
+    /// never asked again.
+    fn request_render(&mut self, page: u32, quality: u32) {
+        if self.render_failed.contains(&page) {
+            return;
+        }
+        let pending_q = self.render_pending.get(&page).copied().unwrap_or(0);
+        let Some(wanted) = request_wants(pending_q, quality) else { return };
+        if let Some(tx) = &self.render_tx {
+            let _ = tx.send(RenderJob {
+                page,
+                quality: wanted,
+            });
+            self.render_pending.insert(page, wanted);
+        }
     }
 
     // ==================================================================
@@ -1435,6 +1872,9 @@ impl Reader {
             let resp = ui.put(card.shrink2(vec2(pad - 5.0, pad - 6.0)), te);
             editing.buf = buf;
             ui.memory_mut(|m| m.request_focus(edit_id));
+            // key events bypass the input-method daemon here — this is the
+            // per-keystroke round-trip that batches and freezes typing
+            ui.output_mut(|o| o.ime = None);
             ui.painter().text(
                 pos2(card.left(), card.bottom() + 12.0),
                 Align2::LEFT_TOP,
@@ -1626,6 +2066,9 @@ impl Reader {
             let resp = ui.put(rect, te);
             editing.buf = buf;
             ui.memory_mut(|m| m.request_focus(edit_id));
+            // key events bypass the input-method daemon here — this is the
+            // per-keystroke round-trip that batches and freezes typing
+            ui.output_mut(|o| o.ime = None);
             ui.painter().text(
                 pos2(rect.left(), rect.bottom() + 12.0),
                 Align2::LEFT_TOP,
@@ -2016,6 +2459,22 @@ impl Reader {
                 mouse_wheel: false,
             })
             .show(ui, |ui| {
+            // bookmarks first: the pages you tagged, tabs lying flat, tips
+            // toward the spine. Click jumps to the page.
+            if !self.flags.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("🔖 Bookmarks")
+                        .strong()
+                        .color(crate::theme::CHAPTER_MARK),
+                );
+                ui.add_space(2.0);
+                for flag in self.flags.clone() {
+                    self.sidebar_flag(ui, &flag);
+                }
+                ui.add_space(10.0);
+            }
+
             let mut last_page: Option<u32> = None;
             for ann in &anns {
                 // page group headers — a thin amber chapter-rule
@@ -2109,6 +2568,128 @@ impl Reader {
                 }
             }
         });
+    }
+
+    /// One sidebar bookmark tab: THE tab - the same paper as the page's,
+    /// fallen over flat (the post-its' rule: sidebar tiles are the desk
+    /// object, pinned to the strip). Colored tip at the west end toward the
+    /// spine, same frost, crease, tongue shadow and per-tab wobble; the
+    /// title lies down with it and reads left-to-right upright, 14pt Rock
+    /// Salt like every other ink in the strip. Pencil & bin ride the hover;
+    /// the pencil opens the same inline editor on the tab's page.
+    fn sidebar_flag(&mut self, ui: &mut Ui, flag: &Flag) {
+        let w = (ui.available_width() - 8.0).max(120.0);
+        let editing = self.editing.as_ref().map(|e| e.id == flag.id).unwrap_or(false);
+
+        // the tab lying down: a quarter-turn of the page object, tip west,
+        // at the book's own proportions with 50% more runway: the ink is
+        // left-aligned, starting at the tongue and running downstream.
+        let ribbon = 24.0;
+        let body_len = ribbon * 3.5 * 1.5;
+        let tip_len = body_len * 0.34;
+        let h = ribbon + 10.0; // the row hugs the slip
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, h), egui::Sense::click());
+        let pivot = pos2(rect.left() + tip_len, rect.center().y);
+        // the same per-tab wobble as on the page, folded into the fall;
+        // ink stays upright (as on the page, ink never wobbles)
+        let wobble = (str_hash01(&flag.id) * 2.0 - 1.0) * 0.038;
+        let lay = -std::f32::consts::FRAC_PI_2 + wobble;
+        paint_tab(ui, flag, pivot, ribbon, body_len, tip_len, lay, false, true, 0.0);
+
+        // the strip's ink starts AT the tip and runs downstream — left-
+        // aligned like a pen touching the sticker's base edge; shrink to
+        // fit within the paper
+        let empty = flag.label.trim().is_empty();
+        let title = if empty {
+            "untitled".to_string()
+        } else {
+            flag.label.trim().to_string()
+        };
+        let mut g = ui.painter().layout_no_wrap(
+            title.clone(),
+            crate::theme::note_font(),
+            Color32::TRANSPARENT,
+        );
+        let mut len = g.size().x;
+        let max_len = body_len - 16.0;
+        if len > max_len && len > 0.0 {
+            let font = egui::FontId::new(
+                (crate::theme::note_font().size * max_len / len).max(6.0),
+                crate::theme::note_font().family.clone(),
+            );
+            g = ui.painter().layout_no_wrap(title.clone(), font, Color32::TRANSPARENT);
+            len = g.size().x;
+        }
+        let r_lay = egui::emath::Rot2::from_angle(lay);
+        let anchor = pivot + r_lay * vec2(0.0, 8.0 + len * 0.5);
+        paint_text_rotated(
+            ui,
+            anchor,
+            0.0,
+            &title,
+            crate::theme::note_font(),
+            max_len,
+            if empty {
+                Color32::from_rgba_unmultiplied(62, 64, 70, 170)
+            } else {
+                Color32::from_rgb(56, 58, 64)
+            },
+        );
+
+        // the page chip: small print at the slip's far end, over the frost
+        ui.painter().text(
+            pos2(rect.left() + tip_len + body_len - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("p. {}", flag.page),
+            FontId::proportional(9.0),
+            Color32::from_rgba_unmultiplied(58, 60, 66, 180),
+        );
+        if editing {
+            let ring = Rect::from_min_max(
+                pos2(rect.left() - 2.0, rect.center().y - ribbon * 0.5 - 2.0),
+                pos2(rect.left() + tip_len + body_len + 4.0, rect.center().y + ribbon * 0.5 + 2.0),
+            );
+            ui.painter().rect_stroke(
+                ring,
+                CornerRadius::same(4),
+                Stroke::new(1.2, crate::theme::CHAPTER_MARK),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        // pencil & bin ride the pointer hover, over the tab's far end
+        let mut used_button = false;
+        if ui.rect_contains_pointer(rect) {
+            if ui
+                .put(
+                    Rect::from_min_size(pos2(rect.right() - 30.0, rect.min.y), vec2(24.0, h)),
+                    egui::Button::new("🗑").small(),
+                )
+                .clicked()
+            {
+                self.delete_flag(&flag.id);
+                used_button = true;
+            }
+            if ui
+                .put(
+                    Rect::from_min_size(pos2(rect.right() - 58.0, rect.min.y), vec2(24.0, h)),
+                    egui::Button::new("✎").small(),
+                )
+                .clicked()
+            {
+                // renaming from the strip takes you to the tab, where the
+                // same inline editor opens as on the page
+                self.go_to_page(flag.page);
+                self.editing = Some(EditingNote {
+                    id: flag.id.clone(),
+                    buf: flag.label.clone(),
+                });
+                used_button = true;
+            }
+        }
+        if resp.clicked() && !used_button {
+            self.go_to_page(flag.page);
+        }
     }
 
     /// One sidebar post-it: the same paper tile code path as the desk,
@@ -2238,6 +2819,9 @@ impl Reader {
         self.annotations =
             crate::store::with_store(&self.store, |s| s.annotations_for_book(self.book.id))
                 .unwrap_or_default();
+        self.flags =
+            crate::store::with_store(&self.store, |s| s.flags_for_book(self.book.id))
+                .unwrap_or_default();
     }
 
     fn navigate_target(&mut self, target: LinkTarget) {
@@ -2351,6 +2935,199 @@ fn ruler_page_marks(anns: &[Annotation]) -> (Vec<u32>, Vec<u32>) {
         }
     }
     (reds.into_iter().collect(), blues.into_iter().collect())
+}
+
+// ===== bookmark tabs ========================================================
+
+/// Ribbon width in screen pt, scaling gently with the page.
+fn tab_ribbon_w(page_w: f32) -> f32 {
+    (page_w * 0.030).clamp(13.0, 26.0)
+}
+
+/// On-page body length (the frosted part below the edge).
+fn tab_body_len(page_h: f32) -> f32 {
+    (page_h * 0.075).clamp(40.0, 96.0)
+}
+
+/// Overhang above the edge — the part a closed book shows.
+fn tab_tip_len(body: f32) -> f32 {
+    (body * 0.34).clamp(12.0, 30.0)
+}
+
+/// Deterministic 0..1 from a string id (tiny fnv, for per-tab tilt).
+fn str_hash01(s: &str) -> f32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    hash01(h as u64)
+}
+
+/// Station of tab k (0 = the page's primary tab) along a sheet's top
+/// edge: the page's precise address — (page-1)/(count-1), the same math
+/// as the ruler — with siblings hugging right in tiny steps; the far
+/// ends nudge inward just enough to keep the whole tab on the sheet.
+fn flag_station_x(page: u32, page_count: u32, sheet_w: f32, cw: f32, k: usize) -> f32 {
+    let count = page_count.max(1) as f32;
+    let addr = if page_count <= 1 {
+        0.5
+    } else {
+        (page as f32 - 1.0) / (count - 1.0)
+    };
+    let step = (cw + 3.0) / sheet_w; // the sibling's tiny gap
+    let pad = (cw * 0.5 + 1.0) / sheet_w;
+    (addr + step * k as f32).clamp(pad, 1.0 - pad)
+}
+
+/// Dedup rule for render requests: `pending_q` is already in flight,
+/// `target_q` is wanted now. Return the quality to actually ask for —
+/// None when the wish is covered or would downgrade an in-flight job.
+fn request_wants(pending_q: u32, target_q: u32) -> Option<u32> {
+    if target_q <= pending_q {
+        None
+    } else {
+        Some(target_q)
+    }
+}
+
+/// One page's first-planted tab wins the pennant color (tabs arrive in
+/// planting order; the stored x is only a record of where its station was).
+fn ruler_flag_pages(flags: &[Flag]) -> Vec<(u32, [u8; 3])> {
+    let mut best: std::collections::BTreeMap<u32, [u8; 3]> = Default::default();
+    for f in flags {
+        best.entry(f.page).or_insert(crate::model::flag_rgb(&f.color));
+    }
+    best.into_iter().collect()
+}
+
+/// Just the tab's tip: shadow + colored tongue above an edge at `pivot`
+/// (the point ON the edge). Bodies and the skyline share it — the sky is
+/// a tab without its paper, nothing more. `lifted` grows the shadow.
+fn paint_tab_tip(ui: &Ui, rgb: [u8; 3], pivot: Pos2, cw: f32, tip: f32, tilt: f32, lifted: bool) {
+    let painter = ui.painter();
+    let r = Rot2::from_angle(tilt);
+    let pt = |v: Vec2| pivot + r * v;
+    let tip_c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    let (sx, sy, sa) = if lifted { (4.0, 6.5, 120u8) } else { (2.2, 3.2, 70u8) };
+    // shadow = the rotated tongue itself, offset screen-down: it falls
+    // with the tab in any orientation (hanging on the page or lying flat
+    // in the strip) instead of staying in the page frame
+    let shadow: Vec<Pos2> = [
+        vec2(-cw * 0.5, -tip),
+        vec2(cw * 0.5, -tip),
+        vec2(cw * 0.5, 0.0),
+        vec2(-cw * 0.5, 0.0),
+    ]
+    .iter()
+    .map(|v| pt(*v) + vec2(sx, sy))
+    .collect();
+    painter.add(Shape::convex_polygon(
+        shadow,
+        Color32::from_black_alpha(sa),
+        Stroke::NONE,
+    ));
+    let tip_pts = vec![
+        pt(vec2(-cw * 0.5, -tip)),
+        pt(vec2(cw * 0.5, -tip)),
+        pt(vec2(cw * 0.5, 0.0)),
+        pt(vec2(-cw * 0.5, 0.0)),
+    ];
+    painter.add(Shape::convex_polygon(tip_pts, tip_c, Stroke::NONE));
+}
+
+/// Paint one tab at `pivot` (the point ON the page's top edge under the
+/// tab's centre). `tilt` carries the per-tab wobble — or the whole
+/// quarter-turn when the tab lies down in the sidebar. `label_angle` is
+/// the ink's own rotation: vertical (spine-reading) on the page, upright
+/// (left-to-right) in the strip. `lifted` = being carried: straight,
+/// fatter shadow.
+fn paint_tab(
+    ui: &Ui,
+    flag: &Flag,
+    pivot: Pos2,
+    cw: f32,
+    body: f32,
+    tip: f32,
+    tilt: f32,
+    lifted: bool,
+    hide_label: bool,
+    label_angle: f32,
+) {
+    let painter = ui.painter();
+    let r = Rot2::from_angle(tilt);
+    let pt = |v: Vec2| pivot + r * v;
+    let rgb = crate::model::flag_rgb(&flag.color);
+    paint_tab_tip(ui, rgb, pivot, cw, tip, tilt, lifted);
+
+    let frost = if lifted {
+        Color32::from_rgba_unmultiplied(249, 249, 246, 230)
+    } else {
+        Color32::from_rgba_unmultiplied(247, 247, 244, 205)
+    };
+    let frost_line = Color32::from_rgba_unmultiplied(126, 128, 133, 130);
+
+    // the frosted body pressed on the page — milky, page text ghosts through
+    let body_pts = vec![
+        pt(vec2(-cw * 0.5, 0.0)),
+        pt(vec2(cw * 0.5, 0.0)),
+        pt(vec2(cw * 0.5, body)),
+        pt(vec2(-cw * 0.5, body)),
+    ];
+    painter.add(Shape::convex_polygon(
+        body_pts,
+        frost,
+        Stroke::new(1.0, frost_line),
+    ));
+
+    // the crease: fold shadow just inside the page edge
+    painter.line_segment(
+        [pt(vec2(-cw * 0.5, 0.8)), pt(vec2(cw * 0.5, 0.8))],
+        Stroke::new(1.4, Color32::from_black_alpha(34)),
+    );
+
+    // the label runs along the tab, reading bottom-to-top like a spine,
+    // in the same handwritten pen as every note
+    if !flag.label.trim().is_empty() && !hide_label {
+        paint_text_rotated(
+            ui,
+            pt(vec2(0.0, body * 0.5)),
+            label_angle,
+            flag.label.trim(),
+            FontId::new(
+                (body * 0.16).clamp(8.5, 13.0),
+                egui::FontFamily::Name(crate::theme::NOTE_FONT_FAMILY.into()),
+            ),
+            body - 10.0,
+            Color32::from_rgb(64, 66, 72),
+        );
+    }
+}
+
+/// Rotated single-line text: lay out upright, then rotate the galley
+/// around the position so its centre lands on `center`.
+fn paint_text_rotated(
+    ui: &Ui,
+    center: Pos2,
+    angle: f32,
+    text: &str,
+    font: FontId,
+    max_len: f32,
+    color: Color32,
+) {
+    let id_for = |s: f32| FontId::new(s, font.family.clone());
+    let mut size = font.size;
+    let mut galley = ui.painter().layout_no_wrap(text.to_owned(), id_for(size), color);
+    let mut sz = galley.size();
+    if sz.x > max_len && sz.x > 0.0 {
+        size = (size * max_len / sz.x).max(6.0);
+        galley = ui.painter().layout_no_wrap(text.to_owned(), id_for(size), color);
+        sz = galley.size();
+    }
+    let half = Rot2::from_angle(angle) * vec2(sz.x * 0.5, sz.y * 0.5);
+    let mut ts = TextShape::new(center - half, galley, color);
+    ts.angle = angle;
+    ui.painter().add(ts);
 }
 
 #[cfg(test)]
@@ -2642,5 +3419,64 @@ mod margin_solve_tests {
         assert_eq!(wb, 238.0);
         assert_eq!(ta, 0.0);
         assert_eq!(tb, 300.0);
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn render_requests_dedupe() {
+        // a cold ask goes out as-is
+        assert_eq!(request_wants(0, 520), Some(520));
+        assert_eq!(request_wants(0, 2000), Some(2000));
+        // a full-quality job already flying covers a preview ask
+        assert_eq!(request_wants(2000, 520), None);
+        assert_eq!(request_wants(2000, 2000), None);
+        // a preview flying upgrades to full when asked
+        assert_eq!(request_wants(520, 2000), Some(2000));
+    }
+
+    #[test]
+    fn stations_are_addresses_with_end_nudges_and_right_hugging_siblings() {
+        let (cw, w) = (16.0, 800.0);
+        // mid-book: the exact percentage, no band, no fudge
+        let mid = flag_station_x(21, 41, w, cw, 0);
+        assert!((mid - 0.5).abs() < 1e-6);
+        // the ends nudge inward by just over half a tab width, nothing more
+        let pad = (cw * 0.5 + 1.0) / w;
+        assert!((flag_station_x(1, 41, w, cw, 0) - pad).abs() < 1e-6);
+        assert!((flag_station_x(41, 41, w, cw, 0) - (1.0 - pad)).abs() < 1e-6);
+        // a sibling hugs right with a tiny gap; it stays near the address
+        let sib = flag_station_x(21, 41, w, cw, 1);
+        let step = (cw + 3.0) / w;
+        assert!(((sib - mid) - step).abs() < 1e-6);
+        assert!(sib - mid < 0.06, "the sibling gap is tiny");
+        // a single-page book centers its lone sheet
+        assert!((flag_station_x(1, 1, w, cw, 0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pennants_dedupe_per_page_and_take_the_first_tab_color() {
+        let f = |page: u32, x: f32, color: &str| Flag {
+            id: format!("{page}-{x}-{color}"),
+            page,
+            x,
+            color: color.to_owned(),
+            label: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let flags = vec![
+            f(7, 0.5, "red"), // first planted on p.7 → red wins
+            f(7, 0.2, "green"),
+            f(7, 0.8, "blue"),
+            f(3, 0.6, "yellow"),
+        ];
+        let out = ruler_flag_pages(&flags);
+        assert_eq!(out.len(), 2, "one pennant per page: {out:?}");
+        assert_eq!(out[0], (3, [242, 200, 56]));
+        assert_eq!(out[1], (7, [232, 74, 74]));
     }
 }

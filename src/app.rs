@@ -25,8 +25,7 @@ enum Mode {
     Reader,
 }
 
-pub struct MarginalApp {
-    store: SharedStore,
+pub struct MarginalApp {    store: SharedStore,
     mode: Mode,
     library: Library,
     reader: Option<Reader>,
@@ -36,6 +35,8 @@ pub struct MarginalApp {
     // frame-time probe (MARGINAL_FRAME_TRACE=1): rolling avg + worst, so
     // perf questions get answered on a stopwatch, not by vibes
     frame_acc_us: u64,
+    /// typist's probe (MARGINAL_TYPE_TRACE=1): the key stream as the app receives it
+    input_trace_t0: Option<std::time::Instant>,
     frame_cnt: u32,
     frame_worst_us: u64,
 }
@@ -86,6 +87,7 @@ impl MarginalApp {
             status: ScanStatus::Idle,
             errors_pending: Vec::new(),
             frame_acc_us: 0,
+            input_trace_t0: None,
             frame_cnt: 0,
             frame_worst_us: 0,
         })
@@ -140,6 +142,46 @@ impl eframe::App for MarginalApp {
         // print the rolling average and the worst pass, plus ppp (the
         // page-quality ladder keys off it)
         let probe_start = std::time::Instant::now();
+        // typist's probe: the key stream AS THE APP RECEIVES IT
+        if std::env::var("MARGINAL_TYPE_TRACE").as_deref() == Ok("1") {
+            let (mut n_press, mut n_rel, mut n_rep) = (0u32, 0u32, 0u32);
+            let mut names: Vec<String> = Vec::new();
+            let mut typed = String::new();
+            ui.input(|i| {
+                for e in &i.events {
+                    match e {
+                        egui::Event::Key { key, pressed, repeat, .. } => {
+                            if *pressed {
+                                n_press += 1;
+                                if *repeat {
+                                    n_rep += 1;
+                                }
+                            } else {
+                                n_rel += 1;
+                            }
+                            names.push(key.name().into());
+                        }
+                        egui::Event::Text(t) => {
+                            typed.push_str(t);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            if n_press + n_rel > 0 {
+                let t0 = *self.input_trace_t0.get_or_insert_with(std::time::Instant::now);
+                eprintln!(
+                    "[type-trace] t={:.2}s press={} rel={} rep={} text_chars={} text={:?} keys={}",
+                    (std::time::Instant::now() - t0).as_secs_f64(),
+                    n_press,
+                    n_rel,
+                    n_rep,
+                    typed.chars().count(),
+                    typed,
+                    names.iter().take(8).cloned().collect::<Vec<_>>().join(",")
+                );
+            }
+        }
         self.poll_scan(ui.ctx());
 
         match self.mode {

@@ -54,6 +54,10 @@ fn main() {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([940.0, 600.0])
             .with_icon(load_icon()),
+        // the old AMD card stumbles under the wgpu/Vulkan stack (desktop-wide
+        // compositor stalls caught on the cpu watch): speak the older,
+        // calmer OpenGL instead. Swap back by deleting this line.
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

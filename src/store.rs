@@ -89,7 +89,19 @@ impl Store {
                 target  TEXT NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_id);",
+            CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_id);
+
+            CREATE TABLE IF NOT EXISTS flags (
+                id         TEXT PRIMARY KEY,
+                book_id    INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                page       INTEGER NOT NULL,
+                x          REAL NOT NULL DEFAULT 0.5,
+                color      TEXT NOT NULL DEFAULT 'red',
+                label      TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_flags_book ON flags(book_id, page);",
         )?;
         Ok(())
     }
@@ -325,6 +337,49 @@ impl Store {
         Ok(())
     }
 
+    // -- bookmark tabs ---------------------------------------------------------
+
+    pub fn flags_for_book(&self, book_id: i64) -> Result<Vec<crate::model::Flag>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, page, x, color, label, created_at, updated_at
+             FROM flags WHERE book_id=?1 ORDER BY page, created_at",
+        )?;
+        let rows = stmt.query_map(params![book_id], |r| {
+            Ok(crate::model::Flag {
+                id: r.get(0)?,
+                page: r.get::<_, i64>(1)? as u32,
+                x: r.get(2)?,
+                color: r.get(3)?,
+                label: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn insert_flag(&self, book_id: i64, f: &crate::model::Flag) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO flags(id, book_id, page, x, color, label, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![f.id, book_id, f.page as i64, f.x, f.color, f.label, f.created_at, f.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_flag(&self, id: &str, page: u32, x: f32, color: &str, label: &str, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE flags SET page=?2, x=?3, color=?4, label=?5, updated_at=?6 WHERE id=?1",
+            params![id, page as i64, x, color, label, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_flag(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM flags WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
     // -- links ---------------------------------------------------------------
 
     pub fn links_for(&self, src_id: &str) -> Result<Vec<(String, LinkTarget)>> {
@@ -436,4 +491,62 @@ pub fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("marginal")
+}
+
+#[cfg(test)]
+mod flag_store_tests {
+    use super::*;
+    use crate::model::Flag;
+
+    fn temp_store() -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "marginal-flag-test-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Store::open(&dir.join("test.db")).unwrap()
+    }
+
+    fn tab(page: u32, x: f32, color: &str, label: &str) -> Flag {
+        Flag {
+            id: uuid::Uuid::new_v4().to_string(),
+            page,
+            x,
+            color: color.to_owned(),
+            label: label.to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn tabs_round_trip_through_the_store() {
+        let store = temp_store();
+        let book = store
+            .upsert_book("fp-flags", "/tmp/x.pdf", "T", BookFormat::Pdf, 1, 1)
+            .unwrap();
+        let a = tab(2, 0.3, "red", "quotes");
+        let b = tab(9, 0.8, "green", "");
+        store.insert_flag(book, &a).unwrap();
+        store.insert_flag(book, &b).unwrap();
+
+        let all = store.flags_for_book(book).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].label, "quotes"); // ordered by page
+        assert_eq!(all[1].page, 9);
+        assert_eq!(all[1].color, "green");
+
+        store
+            .update_flag(&a.id, 4, 0.75, "pink", "renamed", 7)
+            .unwrap();
+        let moved = store.flags_for_book(book).unwrap();
+        let m = moved.iter().find(|f| f.id == a.id).unwrap();
+        assert_eq!((m.page, m.x, m.color.as_str(), m.label.as_str()), (4, 0.75, "pink", "renamed"));
+
+        store.delete_flag(&b.id).unwrap();
+        let left = store.flags_for_book(book).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, a.id);
+    }
 }

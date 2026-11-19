@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-eframe = "0.37.0"
+eframe = { version = "0.37.0", features = ["glow"] }
 egui = "0.37.0"
 hex = "0.4.3"
 image = "0.25.10"
